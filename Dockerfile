@@ -37,6 +37,8 @@ COPY server.mjs ./
 COPY xgnarly.mjs ./
 COPY benchmark.mjs ./
 COPY javascript/ ./javascript/
+# StreamPack addition: the custom sign-server routes (see routes/webcast-connect.mjs).
+COPY routes/ ./routes/
 
 # Set Chrome path for Puppeteer
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium

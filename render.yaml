@@ -1,0 +1,21 @@
+services:
+  - type: pserv
+    name: streampack-tiktok-signer
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: standard
+    region: oregon
+    healthCheckPath: /healthz
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: PROXY_ENABLED
+        value: "false"
+      # Set these two only if TikTok starts blocking Render's shared outbound IPs —
+      # see the plan's §"Escala" for why this isn't turned on from day one.
+      - key: PROXY_HOST
+        sync: false
+      - key: PROXY_USER
+        sync: false
+      - key: PROXY_PASS
+        sync: false

@@ -26,6 +26,8 @@ import { fileURLToPath } from "url";
 import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { encode as encodeXGnarly } from "./xgnarly.mjs";
+import { createWebcastRoutes } from "./routes/webcast-connect.mjs";
+import { createWsProxyRoutes } from "./routes/ws-proxy.mjs";
 
 // Use stealth plugin with default evasions
 puppeteer.use(StealthPlugin());
@@ -238,6 +240,18 @@ async function initBrowser() {
     });
 
     page = await browser.newPage();
+
+    // Registers the in-page WS bridge (see routes/ws-proxy.mjs) — must happen before
+    // this page's first navigation so `evaluateOnNewDocument` covers it.
+    await wsProxy.installBridge(page);
+
+    // Forwards the bridge's own [SP-WS] diagnostic console.log calls (see
+    // routes/ws-proxy.mjs) to this terminal — otherwise they're only visible in the
+    // headless browser's own console, which nothing reads.
+    page.on("console", (msg) => {
+      const text = msg.text();
+      if (text.startsWith("[SP-WS]")) console.log("[Server]", text);
+    });
 
     // Permanent passive listener: every signed request the page emits gets
     // cached by its pathname. /signature reads this cache and returns the
@@ -915,6 +929,25 @@ function parseResult(url, userAgent = null) {
   };
 }
 
+// Custom-sign-server routes (StreamPack addition — see routes/webcast-connect.mjs for
+// why these exist and what they map to). Reuses this same file's browser/signing
+// engine; doesn't duplicate it.
+const tryHandleWebcastRoute = createWebcastRoutes({
+  initBrowser,
+  ensurePageReady,
+  getPage: () => page,
+  generateSignedUrl,
+  getCookies: () => cookies,
+});
+
+// Proxies the real TikTok live-push WebSocket through this same browser session — see
+// routes/ws-proxy.mjs for why a plain Node `ws` connection to TikTok gets soft-rejected.
+const wsProxy = createWsProxyRoutes({
+  initBrowser,
+  ensurePageReady,
+  getPage: () => page,
+});
+
 /**
  * HTTP Request Handler
  */
@@ -924,7 +957,6 @@ async function handleRequest(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Content-Type", "application/json");
 
   if (req.method === "OPTIONS") {
     res.writeHead(200);
@@ -933,6 +965,15 @@ async function handleRequest(req, res) {
   }
 
   try {
+    // The webcast routes set their own content-type (protobuf, not JSON) — checked
+    // before the default `Content-Type: application/json` below applies to everything
+    // else, and inside this SAME try block so a route error gets the same 500 handling
+    // as every other route instead of an unhandled rejection.
+    if (await tryHandleWebcastRoute(req, res, url)) {
+      return;
+    }
+    res.setHeader("Content-Type", "application/json");
+
     // Health check
     if (url.pathname === "/health") {
       const sessionAge = lastInitTime
@@ -1121,6 +1162,15 @@ async function handleRequest(req, res) {
 // Create server
 const server = http.createServer(handleRequest);
 
+server.on("upgrade", (req, socket, head) => {
+  wsProxy.handleUpgrade(req, socket, head).catch((e) => {
+    console.error("[Server] ws-proxy upgrade error:", e.message);
+    try {
+      socket.destroy();
+    } catch {}
+  });
+});
+
 server.listen(PORT, () => {
   console.log(`[Server] TikTok Signature Server running on port ${PORT}`);
   console.log(`[Server] Endpoints:`);
@@ -1132,6 +1182,7 @@ server.listen(PORT, () => {
   );
   console.log(`  GET  /health    - Health check`);
   console.log(`  GET  /restart   - Restart browser session`);
+  console.log(`  WS   /webcast/ws-proxy?target=... - proxies a WS through the browser`);
 
   // Initialize browser on startup
   initBrowser().catch((e) => console.error("[Server] Init failed:", e.message));

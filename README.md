@@ -2,6 +2,11 @@
 
 ![NPM](https://img.shields.io/npm/l/tiktok-signature.svg?style=for-the-badge) ![npm](https://img.shields.io/npm/v/tiktok-signature.svg?style=for-the-badge)
 
+> **This is a fork** of [carcabot/tiktok-signature](https://github.com/carcabot/tiktok-signature),
+> kept under the same MIT license. Everything below this notice is the original
+> project's documentation, unchanged. See "Custom sign-server routes (
+> addition)" further down for what was added and why.
+
 Generate valid **X-Bogus** and **X-Gnarly** signatures for TikTok API requests. This service uses a headless browser with TikTok's own SDK to generate authentic signatures that work reliably.
 
 > **Free & Open Source**: While many services charge for TikTok signature generation, this project provides a fully functional solution **completely free**. If you find it useful, consider [buying me a coffee](https://www.buymeacoffee.com/carcabot) ☕
@@ -367,14 +372,20 @@ See the `examples/` folder for more complete examples (comments, search, trendin
 
 ### Environment Variables
 
-| Variable                    | Default | Description                                          |
-| --------------------------- | ------- | ---------------------------------------------------- |
-| `PORT`                      | `8080`  | Server port                                          |
-| `PROXY_ENABLED`             | `false` | Enable proxy support                                 |
-| `PROXY_HOST`                | -       | Proxy host and port (e.g., `proxy.example.com:8080`) |
-| `PROXY_USER`                | -       | Proxy username                                       |
-| `PROXY_PASS`                | -       | Proxy password                                       |
-| `PUPPETEER_EXECUTABLE_PATH` | auto    | Custom Chrome/Chromium path                          |
+| Variable                       | Default   | Description                                                        |
+| ------------------------------ | --------- | -------------------------------------------------------------------- |
+| `PORT`                         | `8080`    | Server port                                                         |
+| `PROXY_ENABLED`                | `false`   | Enable proxy support                                                |
+| `PROXY_HOST`                   | -         | Proxy host and port (e.g., `proxy.example.com:8080`)                |
+| `PROXY_USER`                   | -         | Proxy username                                                      |
+| `PROXY_PASS`                   | -         | Proxy password                                                      |
+| `MAX_GENERATIONS_BEFORE_REFRESH` | `500`   | Restart the browser session after this many signatures              |
+| `MAX_SESSION_AGE_MS`           | `1800000` (30 min) | Restart the browser session after this many milliseconds |
+| `PUPPETEER_EXECUTABLE_PATH`    | auto      | Custom Chrome/Chromium path (set to `/usr/bin/chromium` in Docker)  |
+
+None of these are required — the server runs with sane defaults out of the box. Only
+set `PROXY_*` if TikTok starts blocking your outbound IP (see "Proxy Configuration"
+below).
 
 ### Proxy Configuration
 
@@ -431,6 +442,40 @@ docker compose logs -f
 # Stop
 docker compose down
 ```
+
+### Render (production)
+
+This fork deploys as a private service on [Render](https://render.com) via
+[`render.yaml`](./render.yaml):
+
+- `runtime: docker`, built from the repo's own `Dockerfile` — no separate build step.
+- `plan: standard`, `region: oregon`.
+- `healthCheckPath: /healthz` — Render's own health check hits the deliberately
+  dumb/fast `GET /healthz` (see
+  ["Custom sign-server routes"]
+  below), which is intentionally **different** from the Docker container's own
+  `HEALTHCHECK` directive in the `Dockerfile`, which polls the richer `GET /health`
+  diagnostics endpoint instead. Both are correct; they just serve different callers.
+- `PORT` and `PROXY_ENABLED` are set as plain values in `render.yaml`; `PROXY_HOST`,
+  `PROXY_USER`, and `PROXY_PASS` are declared with `sync: false` (Render secrets you
+  set manually in the dashboard) and are only needed if TikTok starts blocking
+  Render's shared outbound IPs.
+
+To deploy: connect the repo in the Render dashboard and it will pick up
+`render.yaml` automatically (Blueprint deploy).
+
+### CI/CD
+
+- **[`ci.yml`](./.github/workflows/ci.yml)** — runs on every push/PR to `master`:
+  `test` (Node 18.x and 20.x matrix, `npm ci` with `PUPPETEER_SKIP_DOWNLOAD=true`,
+  then `npm test`), `lint` (`prettier --check` over `.mjs`/`.js`/`.md`/workflow
+  files), and `security` (`npm audit --audit-level=critical --omit=dev`).
+- **[`docker-publish.yml`](./.github/workflows/docker-publish.yml)** — builds and
+  pushes a multi-arch (`linux/amd64`, `linux/arm64`) image to GHCR
+  (`ghcr.io/<owner>/<repo>`) on version tags (`v*`) or manual dispatch. Tags the
+  image with semver variants (`{{version}}`, `{{major}}.{{minor}}`, `{{major}}`) and
+  additionally with `latest`, but only for non-prerelease version tags or manual
+  dispatch.
 
 ## Benchmark
 
@@ -634,3 +679,43 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 **Note**: This service is for educational and research purposes. Ensure compliance with TikTok's Terms of Service when using this tool.
+
+---
+
+## Custom sign-server routes (addition)
+
+Three routes added on top of the upstream engine above, in `routes/webcast-connect.mjs`
+— nothing in the signing core changes. These exist so a TikTok webcast client
+(`TikTok-Live-Connector` and family) can point its `SignConfig.basePath` at this
+service instead of a paid one, per the "custom sign server" contract those libraries
+already support.
+
+### `GET /webcast/rooms/:roomId/connect`
+
+Signs and performs the real request to TikTok's webcast fetch endpoint, returning the
+raw protobuf bytes (not JSON) plus the session cookies the connecting client needs.
+
+```
+GET /webcast/rooms/7123456789012345678/connect?unique_id=someuser&cursor=0&client_enter=true
+```
+
+Response: `200`, `Content-Type: application/protobuf`, header `x-set-tt-cookie` set,
+body = raw `WebcastResponse` protobuf bytes.
+
+### `POST /webcast/sign_url`
+
+Thin alias of `/signature` above, returning just `{ "signedUrl": "..." }`.
+
+### `GET /healthz`
+
+Trivial `200 ok` — separate from the richer `/health` above, only because Render's
+health checker wants something dumb and fast.
+
+### ⚠️ Not yet verified against a live room
+
+`buildTikTokWebcastUrl` in `routes/webcast-connect.mjs` reconstructs TikTok's own query
+parameters for its real webcast fetch endpoint from publicly known browser-fingerprint
+conventions (the same family this README's own examples already use for
+`item_list`/etc.) — it has **not** been diffed against a byte-for-byte capture of the
+real endpoint from a browser's DevTools Network tab while watching an actual TikTok
+LIVE. Do that reconciliation before pointing a real client at this in production.
