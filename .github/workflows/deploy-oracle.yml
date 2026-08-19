@@ -1,0 +1,26 @@
+# Auto-deploy al pushear a main — corre en el runner self-hosted instalado en la VM de
+# Oracle (ver DEPLOYMENT-ORACLE.md en streampack-studio). El runner ya tiene el repo
+# clonado en ~/streampack/tiktok-signer (parte del setup manual inicial) — este workflow
+# solo lo actualiza y reconstruye el contenedor, no hace un checkout nuevo.
+#
+# A propósito SOLO en `push` a `main`, nunca en `pull_request`: un runner self-hosted en
+# un repo público es un vector de ataque conocido si se dispara con pull_request — sea
+# quien sea que abra un PR podría hacer correr código en la VM. Este repo es público
+# (fork de carcabot/tiktok-signature), así que esto importa acá más que en los otros dos.
+name: Deploy a Oracle
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: git reset --hard al último main y reconstruir
+        run: |
+          cd ~/streampack/tiktok-signer
+          git fetch origin main
+          git reset --hard origin/main
+          cd ~/streampack
+          docker compose up -d --build tiktok-signer
