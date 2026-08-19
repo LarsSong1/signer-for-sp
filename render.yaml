@@ -5,7 +5,11 @@ services:
     dockerfilePath: ./Dockerfile
     plan: standard
     region: oregon
-    healthCheckPath: /healthz
+    # Un servicio `pserv` (privado) no admite `healthCheckPath` en el Blueprint de
+    # Render — lo rechaza al validar ("pserv service type cannot have a health check
+    # path"). Render igual controla que el proceso esté vivo por su cuenta; el
+    # `/healthz` más completo de este servicio sigue estando disponible para quien
+    # quiera pegarle a mano (por la Shell de Render, o desde el gateway que lo consume).
     envVars:
       - key: PORT
         value: 8080
