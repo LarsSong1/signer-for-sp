@@ -60,8 +60,11 @@ export function createWebcastRoutes({
 
     const uniqueId = query.get("unique_id");
     if (!uniqueId) {
+      // DIAGNOSTIC — what the gateway actually sent, so the next failure says
+      // something instead of another guess at the param name.
+      console.log(`[webcast] /connect for roomId=${roomId} — full query: ${query.toString()}`);
       res.writeHead(400, { "content-type": "application/json" });
-      res.end(JSON.stringify({ message: "unique_id query param is required" }));
+      res.end(JSON.stringify({ message: `unique_id query param is required (got: ${query.toString()})` }));
       return;
     }
 
