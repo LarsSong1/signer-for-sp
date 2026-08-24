@@ -603,10 +603,33 @@ async function generateSignedUrl(
 async function fetchWebcastRawBytes(targetUrl, userAgent) {
   return queueSignatureRequest(async () => {
     const signed = await _generateSignedUrlInternal(targetUrl, userAgent, null);
-    const cookieHeader = (cookies || []).map((c) => `${c.name}=${c.value}`).join("; ");
+    let cookieHeader = (cookies || []).map((c) => `${c.name}=${c.value}`).join("; ");
+    // `tiktok-live-connector` always sends this as a baseline cookie for this exact
+    // route (`lib-CbB_CSnH.js` DEFAULT_HTTP_CLIENT_HEADERS) — add it if the real
+    // browser session didn't already set one itself.
+    if (!/(^|;\s*)tt-target-idc=/.test(cookieHeader)) {
+      cookieHeader = cookieHeader
+        ? `${cookieHeader}; tt-target-idc=useast1a`
+        : "tt-target-idc=useast1a";
+    }
+    // Everything below (Referer/Origin/Sec-Fetch-*/etc.) mirrors that same library's
+    // known-working default headers for `webcast.tiktok.com` requests — our previous
+    // bare {Accept,Cookie,User-Agent} was missing exactly the fetch-metadata TikTok's
+    // edge checks for, which explains the silent `200 bytes=0` (a bot-mitigation
+    // block, not a signature or parsing problem — the signature was already valid).
     const response = await fetch(signed.signedUrl, {
       headers: {
-        Accept: "application/protobuf,application/json",
+        Accept: "text/html,application/json,application/protobuf",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        Connection: "keep-alive",
+        "Cache-Control": "max-age=0",
+        Referer: "https://www.tiktok.com/",
+        Origin: "https://www.tiktok.com",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Ua-Mobile": "?0",
         Cookie: cookieHeader,
         "User-Agent": userAgent || currentUserAgent || "",
       },
