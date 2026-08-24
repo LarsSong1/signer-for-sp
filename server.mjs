@@ -102,6 +102,9 @@ let isReady = false;
 let generationCount = 0;
 let initMethod = null;
 let lastInitTime = null;
+// Which uniqueId's `/live` page the shared session last navigated to for
+// `ensureLiveRoomContext` — see that function for why this exists.
+let currentRoomContextUniqueId = null;
 
 // Cache of page-emitted signed URLs, keyed by pathname.
 const signedUrlCache = new Map();
@@ -366,6 +369,56 @@ async function dismissTikTokErrorIfPresent(maxAttempts = 2) {
 }
 
 /**
+ * Navigates the shared session to the SPECIFIC room's `/@<uniqueId>/live` page before
+ * signing that room's webcast requests — separate from (and doesn't replace) the
+ * one-time `@zara` navigation `initWithLocalSdk` does at startup just to bootstrap the
+ * SDK. Investigated live: every request so far has been signed from that same fixed,
+ * generic profile page regardless of which room is actually being connected to, while
+ * the signed request targets a completely different host (`webcast.tiktok.com`).
+ * TikTok's anti-bot state (msToken rotation, acrawler heartbeat) is plausibly bound to
+ * the page/JS-bundle context it was generated from — a signature can be well-formed
+ * (the SDK call itself succeeds) and still get rejected server-side if it doesn't
+ * correspond to a real live-viewing session. This is the first thing to try before any
+ * more TikTok-side param/header guessing.
+ *
+ * Only re-navigates when the target user actually changes — a full navigation on every
+ * single fetch would blow the ~15s warm-session budget this whole design exists to
+ * avoid. SDK injection (`evaluateOnNewDocument`) and request interception both already
+ * persist across navigations (see the comment above the `dismissTikTokErrorIfPresent`
+ * call in `initWithLocalSdk`), so nothing needs to be rewired here for that.
+ */
+async function ensureLiveRoomContext(uniqueId) {
+  if (!uniqueId || uniqueId === currentRoomContextUniqueId) return;
+
+  console.log(`[Server] Navigating to live room context for @${uniqueId}...`);
+  await page.goto(`https://www.tiktok.com/@${uniqueId}/live`, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000,
+  });
+  await dismissTikTokErrorIfPresent();
+
+  // Reuses the same readiness check `initWithLocalSdk` uses after its own navigation —
+  // if the SDK isn't alive on this new page, throw the same message
+  // `_generateSignedUrlInternal`'s recovery path already looks for ("SDK not
+  // initialized|SDK not ready"), so a bad navigation self-heals via the existing
+  // close+reinit retry instead of silently signing against a half-loaded page.
+  const sdkStatus = await page.evaluate(() => {
+    const hasAcrawler = !!window.byted_acrawler;
+    const hasFrontierSign =
+      hasAcrawler && typeof window.byted_acrawler.frontierSign === "function";
+    return { hasAcrawler, hasFrontierSign };
+  });
+  if (!sdkStatus.hasFrontierSign) {
+    throw new Error(
+      `SDK not ready after navigating to @${uniqueId}/live: ${JSON.stringify(sdkStatus)}`,
+    );
+  }
+
+  currentRoomContextUniqueId = uniqueId;
+  console.log(`[Server] Live room context ready for @${uniqueId}`);
+}
+
+/**
  * Initialize with TikTok page context and LOCAL SDK
  * Injects local SDK BEFORE page loads using evaluateOnNewDocument
  */
@@ -503,6 +556,7 @@ async function closeBrowser() {
   generationCount = 0;
   initMethod = null;
   lastInitTime = null;
+  currentRoomContextUniqueId = null;
 
   if (browser) {
     try {
@@ -661,8 +715,13 @@ async function fetchViaBrowserNetworkStack(url) {
   return { status: resource.httpStatusCode || 200, bytes: Buffer.concat(chunks) };
 }
 
-async function fetchWebcastRawBytes(targetUrl, userAgent) {
+async function fetchWebcastRawBytes(targetUrl, userAgent, uniqueId) {
   return queueSignatureRequest(async () => {
+    // Must run inside this same queue slot, before signing — an overlapping request's
+    // navigation must not interrupt this one's signing mid-flight, same reasoning as
+    // signing+fetching already being one slot together (see this function's own
+    // existing header comment below).
+    await ensureLiveRoomContext(uniqueId);
     const signed = await _generateSignedUrlInternal(targetUrl, userAgent, null);
     // Extra headers set here apply session-wide, so they're set right before the
     // load and cleared right after — nothing else runs concurrently on this session

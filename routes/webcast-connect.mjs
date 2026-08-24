@@ -109,9 +109,11 @@ function buildTikTokWebcastUrl({ roomId, uniqueId, cursor, userAgent, clientEnte
  *   Existing `/signature` engine, already self-queued — reused as-is for
  *   `/webcast/sign_url`, which only signs (no follow-up fetch, so nothing else can
  *   race it).
- * @param {(targetUrl: string, userAgent?: string) => Promise<{status: number, bytes: Buffer}>} deps.fetchWebcastRawBytes
- *   Signs `targetUrl` and fetches it with Node's own `fetch` — see this file's own
- *   header comment for why that replaced the two earlier, browser-side attempts.
+ * @param {(targetUrl: string, userAgent: string | null, uniqueId: string | null) => Promise<{status: number, bytes: Buffer}>} deps.fetchWebcastRawBytes
+ *   Navigates the shared session to `uniqueId`'s real `/live` page (if it isn't there
+ *   already), signs `targetUrl`, then fetches it through the browser's own network
+ *   stack via CDP — see this file's own header comment and `server.mjs`'s
+ *   `ensureLiveRoomContext`/`fetchViaBrowserNetworkStack` for why.
  * @param {() => Array<{name: string, value: string}>} deps.getCookies
  */
 export function createWebcastRoutes({
@@ -137,7 +139,7 @@ export function createWebcastRoutes({
 
     let raw;
     try {
-      raw = await fetchWebcastRawBytes(targetUrl, userAgent || null);
+      raw = await fetchWebcastRawBytes(targetUrl, userAgent || null, query.get("unique_id"));
     } catch (e) {
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ message: `webcast fetch failed: ${e.message}` }));
