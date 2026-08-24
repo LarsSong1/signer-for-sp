@@ -2,7 +2,15 @@
 FROM node:20-slim
 
 # Install Chromium and dependencies
+#
+# `ca-certificates` is NOT bundled by `node:20-slim` — without it, neither `curl` nor
+# the Debian-packaged `chromium` below (which validates TLS through NSS + the system
+# trust store, unlike Google's own Chrome builds and unlike Node's own `fetch`, which
+# both carry their own root store) has any CA to verify against. Every HTTPS request
+# the in-page browser makes — including the ones the TikTok SDK triggers on its own —
+# failed with a bare "Failed to fetch" and no other clue, until this was added.
 RUN apt-get update && apt-get install -y \
+    ca-certificates \
     chromium \
     fonts-liberation \
     libasound2 \
