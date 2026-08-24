@@ -243,6 +243,14 @@ async function initBrowser() {
     page = await browser.newPage();
     cdpSession = await page.createCDPSession();
     await cdpSession.send("Network.enable");
+    // `Network.loadNetworkResource` (used by `fetchViaBrowserNetworkStack`) enforces
+    // the page's live CSP — confirmed live: it rejected the webcast.tiktok.com load
+    // with "CSP violation" even though `connect-src *` is present in TikTok's own
+    // response headers (checked earlier this session), so whatever's actually being
+    // evaluated here isn't that. Bypassing CSP entirely for this page sidesteps it —
+    // safe here since this page only ever does two things: sign via the SDK
+    // (page.evaluate, unaffected by CSP) and this resource load.
+    await page.setBypassCSP(true);
 
     // Registers the in-page WS bridge (see routes/ws-proxy.mjs) — must happen before
     // this page's first navigation so `evaluateOnNewDocument` covers it.
