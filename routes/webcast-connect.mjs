@@ -113,10 +113,26 @@ async function fetchRawBytesThroughPage(page, signedUrl) {
  * @param {() => Promise<void>} deps.ensurePageReady
  * @param {() => import('puppeteer').Page} deps.getPage
  * @param {(targetUrl: string, userAgent?: string) => Promise<any>} deps.generateSignedUrl
- *   Existing `/signature` engine — reused as-is for `/webcast/sign_url`.
+ *   Existing `/signature` engine, already self-queued — reused as-is for
+ *   `/webcast/sign_url`, which only signs (no follow-up page fetch, so nothing else
+ *   can race it).
+ * @param {(targetUrl: string, userAgent?: string, navigateTo?: string) => Promise<any>} deps.generateSignedUrlUnqueued
+ *   Same signing engine, WITHOUT its own queue wrapper — for `/webcast/rooms/:id/connect`,
+ *   which needs to run the sign step AND the raw-bytes fetch that follows it as a
+ *   single atomic turn on the shared browser page (see `handleConnect`'s own comment).
+ * @param {(fn: () => Promise<any>) => Promise<any>} deps.queueSignatureRequest
+ *   The raw request queue `generateSignedUrl` normally wraps itself in.
  * @param {() => Array<{name: string, value: string}>} deps.getCookies
  */
-export function createWebcastRoutes({ initBrowser, ensurePageReady, getPage, generateSignedUrl, getCookies }) {
+export function createWebcastRoutes({
+  initBrowser,
+  ensurePageReady,
+  getPage,
+  generateSignedUrl,
+  generateSignedUrlUnqueued,
+  queueSignatureRequest,
+  getCookies,
+}) {
   /** GET /webcast/rooms/:roomId/connect */
   async function handleConnect(req, res, roomId, query) {
     await initBrowser();
@@ -130,13 +146,24 @@ export function createWebcastRoutes({ initBrowser, ensurePageReady, getPage, gen
       clientEnter: query.get("client_enter") === "true" || query.get("client_enter") === "1",
     });
 
-    // Reuses the SAME sign+navigate machinery `/signature` already uses (this module
-    // never touches the browser/SDK internals directly).
-    const signed = await generateSignedUrl(targetUrl, query.get("user_agent") || null);
-
+    // Sign AND fetch the raw bytes as ONE turn on the shared page queue — not two
+    // separate queued calls back to back. The real bug this fixes: `generateSignedUrl`
+    // used to release its queue slot as soon as SIGNING finished, so a second overlapping
+    // `/connect` request (the gateway retries every ~2.5s) could start its OWN
+    // `page.goto()` navigation while THIS request's `fetchRawBytesThroughPage` still had
+    // a `page.evaluate(...)` fetch in flight on that same page — tearing down its JS
+    // execution context mid-await and leaving `response` as `undefined`, which surfaced
+    // as the cryptic "Cannot read properties of undefined (reading 'arrayBuffer')".
+    // Wrapping the whole sequence in one `queueSignatureRequest` call closes that gap.
     let raw;
     try {
-      raw = await fetchRawBytesThroughPage(getPage(), signed.signedUrl);
+      raw = await queueSignatureRequest(async () => {
+        // Reuses the SAME sign+navigate machinery `/signature` already uses (this
+        // module never touches the browser/SDK internals directly) — the UNQUEUED
+        // variant, since we're already inside the queue here.
+        const signed = await generateSignedUrlUnqueued(targetUrl, query.get("user_agent") || null);
+        return fetchRawBytesThroughPage(getPage(), signed.signedUrl);
+      });
     } catch (e) {
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ message: `webcast fetch failed: ${e.message}` }));

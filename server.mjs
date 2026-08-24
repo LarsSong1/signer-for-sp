@@ -937,6 +937,11 @@ const tryHandleWebcastRoute = createWebcastRoutes({
   ensurePageReady,
   getPage: () => page,
   generateSignedUrl,
+  // Unqueued sign step + the raw-page queue itself — `/webcast/rooms/:id/connect`
+  // needs to run its sign+fetch as ONE atomic queue slot (see that route's own
+  // comment on why), not two separate `queueSignatureRequest` calls back to back.
+  generateSignedUrlUnqueued: _generateSignedUrlInternal,
+  queueSignatureRequest,
   getCookies: () => cookies,
 });
 
