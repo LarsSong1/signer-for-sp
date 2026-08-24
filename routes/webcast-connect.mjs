@@ -81,11 +81,27 @@ function buildTikTokWebcastUrl({ roomId, uniqueId, cursor, userAgent, clientEnte
  */
 async function fetchRawBytesThroughPage(page, signedUrl) {
   const result = await page.evaluate(async (url) => {
+    // DIAGNOSTIC — this used to be a plain `const response = await fetch(...)`, whose
+    // failure mode ("Cannot read properties of undefined (reading 'arrayBuffer')")
+    // gave zero clue WHY `response` itself came back falsy: a CORS block, an aborted
+    // request from the page's own interception handler, or `fetch` genuinely resolving
+    // to something unexpected all look identical from the outside. Splitting the two
+    // awaits and reporting `response`'s own shape (or its absence) before ever
+    // touching `.arrayBuffer()` turns the next failure into a real answer instead of
+    // another guess.
+    let response;
     try {
-      const response = await fetch(url, {
+      response = await fetch(url, {
         credentials: "include",
         headers: { Accept: "application/protobuf,application/json" },
       });
+    } catch (e) {
+      return { error: `fetch() rejected: ${e.name}: ${e.message}` };
+    }
+    if (!response) {
+      return { error: `fetch() resolved but returned a falsy value (typeof fetch=${typeof fetch})` };
+    }
+    try {
       const buf = await response.arrayBuffer();
       let binary = "";
       const bytes = new Uint8Array(buf);
@@ -95,7 +111,9 @@ async function fetchRawBytesThroughPage(page, signedUrl) {
         bodyBase64: btoa(binary),
       };
     } catch (e) {
-      return { error: e.message };
+      return {
+        error: `arrayBuffer() failed on a real response (status=${response.status} type=${response.type} ok=${response.ok}): ${e.message}`,
+      };
     }
   }, signedUrl);
 
