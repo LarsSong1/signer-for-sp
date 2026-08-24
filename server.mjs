@@ -626,7 +626,7 @@ async function fetchViaBrowserNetworkStack(url) {
   const { resource } = await cdpSession.send("Network.loadNetworkResource", {
     frameId,
     url,
-    options: { disposition: "Diskless", includeCredentials: true },
+    options: { disposition: "Diskless", includeCredentials: true, disableCache: true },
   });
   if (!resource.success || !resource.stream) {
     return {
