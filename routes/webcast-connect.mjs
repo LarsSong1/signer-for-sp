@@ -13,113 +13,20 @@
  *     headers out: x-set-tt-cookie (REQUIRED), x-room-id (optional)
  *     body out: raw bytes of TikTok's own protobuf `WebcastResponse` — NOT JSON.
  *
- * carcabot's existing engine (browser + local TikTok SDK) does the signing; this file
- * only adds the glue that (a) builds TikTok's REAL webcast fetch URL from the params
- * above, (b) signs it the same way `/signature` already does, (c) actually performs
- * the request and hands back the raw bytes instead of JSON-parsing them.
- *
- * ⚠️ NOT YET VERIFIED AGAINST A LIVE ROOM. TikTok's exact query-parameter set for its
- * real `webcast/im/fetch` endpoint is reconstructed here from the publicly documented
- * browser-fingerprint parameters carcabot's own README already uses for other TikTok
- * endpoints (the same `aid`/`app_language`/`device_platform`/… family) — it has NOT
- * been diffed against a byte-for-byte browser capture of the live endpoint yet. Before
- * connecting a real client, capture one real request in a browser's DevTools Network
- * tab while watching a real TikTok LIVE, and reconcile `buildTikTokWebcastUrl` below
- * against it. See "Verificación", paso 1, in the project's plan.
+ * ⚠️ The first version of this route built TikTok's `webcast/im/fetch` URL by hand,
+ * signed it the same way `/signature` does, and fetched it with an injected
+ * `fetch()` call from page-side JS. Verified LIVE (not assumed) that this never
+ * worked: TikTok's CORS policy on that endpoint rejects a cross-origin fetch issued
+ * by injected code — confirmed by isolating the failure with a diagnostic pass
+ * (`fetch() rejected: TypeError: Failed to fetch`, 100% of attempts, not
+ * intermittent — ruling out flakiness or a signing bug). `handleConnect` now instead
+ * navigates to the target user's real LIVE page and captures the raw bytes of
+ * whatever matching request TikTok's OWN first-party JS makes there (see
+ * `fetchWebcastRawBytes` in `server.mjs`) — response bytes read via Puppeteer's CDP
+ * layer aren't subject to the page's own fetch()-level CORS enforcement, so this
+ * sidesteps the wall instead of fighting it. Still not diffed against Euler Stream's
+ * own reference implementation, so treat as freshly-live-tested, not battle-hardened.
  */
-
-const TIKTOK_WEBCAST_FETCH_URL = "https://webcast.tiktok.com/webcast/im/fetch/";
-
-/** TikTok's own param names for the webcast fetch endpoint, built from the sign
- *  server's simplified query params. Needs the live-capture check noted above. */
-function buildTikTokWebcastUrl({ roomId, uniqueId, cursor, userAgent, clientEnter }) {
-  const params = new URLSearchParams({
-    aid: "1988",
-    app_language: "en",
-    app_name: "tiktok_web",
-    browser_language: "en-US",
-    browser_name: "Mozilla",
-    browser_online: "true",
-    browser_platform: "MacIntel",
-    browser_version: "5.0",
-    channel: "tiktok_web",
-    cookie_enabled: "true",
-    device_platform: "web_pc",
-    focus_state: "true",
-    from_page: "user",
-    history_len: "2",
-    is_fullscreen: "false",
-    is_page_visible: "true",
-    did_rule: "3",
-    fetch_rule: "1",
-    identity: "audience",
-    last_rtt: "0",
-    live_id: "12",
-    os: "mac",
-    priority_region: "",
-    resp_content_type: "protobuf",
-    screen_height: "1080",
-    screen_width: "1920",
-    tz_name: "America/New_York",
-    root_referer: "https://www.tiktok.com/",
-    referer: "https://www.tiktok.com/",
-    room_id: roomId,
-    cursor: cursor || "",
-    internal_ext: "",
-    client_enter: clientEnter ? "1" : "0",
-  });
-  if (uniqueId) params.set("target_uid", uniqueId);
-  if (userAgent) params.set("user_agent", userAgent);
-  return `${TIKTOK_WEBCAST_FETCH_URL}?${params.toString()}`;
-}
-
-/**
- * Fetches the RAW bytes of a signed URL through the browser page — the protobuf-safe
- * sibling of the existing `/fetch` route, which JSON-parses the response and would
- * corrupt binary data. Bytes cross the `page.evaluate` boundary as base64, since
- * Puppeteer serializes return values as JSON.
- */
-async function fetchRawBytesThroughPage(page, signedUrl) {
-  const result = await page.evaluate(async (url) => {
-    // DIAGNOSTIC — this used to be a plain `const response = await fetch(...)`, whose
-    // failure mode ("Cannot read properties of undefined (reading 'arrayBuffer')")
-    // gave zero clue WHY `response` itself came back falsy: a CORS block, an aborted
-    // request from the page's own interception handler, or `fetch` genuinely resolving
-    // to something unexpected all look identical from the outside. Splitting the two
-    // awaits and reporting `response`'s own shape (or its absence) before ever
-    // touching `.arrayBuffer()` turns the next failure into a real answer instead of
-    // another guess.
-    let response;
-    try {
-      response = await fetch(url, {
-        credentials: "include",
-        headers: { Accept: "application/protobuf,application/json" },
-      });
-    } catch (e) {
-      return { error: `fetch() rejected: ${e.name}: ${e.message}` };
-    }
-    if (!response) {
-      return { error: `fetch() resolved but returned a falsy value (typeof fetch=${typeof fetch})` };
-    }
-    try {
-      const buf = await response.arrayBuffer();
-      let binary = "";
-      const bytes = new Uint8Array(buf);
-      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-      return {
-        status: response.status,
-        bodyBase64: btoa(binary),
-      };
-    } catch (e) {
-      return {
-        error: `arrayBuffer() failed on a real response (status=${response.status} type=${response.type} ok=${response.ok}): ${e.message}`,
-      };
-    }
-  }, signedUrl);
-
-  if (result.error) throw new Error(result.error);
-  return { status: result.status, bytes: Buffer.from(result.bodyBase64, "base64") };
-}
 
 /**
  * Registers the two new routes on the existing HTTP router. Called once from
@@ -129,26 +36,21 @@ async function fetchRawBytesThroughPage(page, signedUrl) {
  * @param {object} deps
  * @param {() => Promise<void>} deps.initBrowser
  * @param {() => Promise<void>} deps.ensurePageReady
- * @param {() => import('puppeteer').Page} deps.getPage
  * @param {(targetUrl: string, userAgent?: string) => Promise<any>} deps.generateSignedUrl
  *   Existing `/signature` engine, already self-queued — reused as-is for
  *   `/webcast/sign_url`, which only signs (no follow-up page fetch, so nothing else
  *   can race it).
- * @param {(targetUrl: string, userAgent?: string, navigateTo?: string) => Promise<any>} deps.generateSignedUrlUnqueued
- *   Same signing engine, WITHOUT its own queue wrapper — for `/webcast/rooms/:id/connect`,
- *   which needs to run the sign step AND the raw-bytes fetch that follows it as a
- *   single atomic turn on the shared browser page (see `handleConnect`'s own comment).
- * @param {(fn: () => Promise<any>) => Promise<any>} deps.queueSignatureRequest
- *   The raw request queue `generateSignedUrl` normally wraps itself in.
+ * @param {(uniqueId: string) => Promise<{status: number, bytes: Buffer}>} deps.fetchWebcastRawBytes
+ *   Navigates to `@uniqueId`'s real LIVE page and returns the raw bytes TikTok's own
+ *   page naturally received from `webcast/im/fetch` — see this file's own header
+ *   comment for why this replaced the sign+fetch approach.
  * @param {() => Array<{name: string, value: string}>} deps.getCookies
  */
 export function createWebcastRoutes({
   initBrowser,
   ensurePageReady,
-  getPage,
   generateSignedUrl,
-  generateSignedUrlUnqueued,
-  queueSignatureRequest,
+  fetchWebcastRawBytes,
   getCookies,
 }) {
   /** GET /webcast/rooms/:roomId/connect */
@@ -156,44 +58,26 @@ export function createWebcastRoutes({
     await initBrowser();
     await ensurePageReady();
 
-    const targetUrl = buildTikTokWebcastUrl({
-      roomId,
-      uniqueId: query.get("unique_id"),
-      cursor: query.get("cursor"),
-      userAgent: query.get("user_agent"),
-      clientEnter: query.get("client_enter") === "true" || query.get("client_enter") === "1",
-    });
+    const uniqueId = query.get("unique_id");
+    if (!uniqueId) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "unique_id query param is required" }));
+      return;
+    }
 
-    // Sign AND fetch the raw bytes as ONE turn on the shared page queue — not two
-    // separate queued calls back to back. The real bug this fixes: `generateSignedUrl`
-    // used to release its queue slot as soon as SIGNING finished, so a second overlapping
-    // `/connect` request (the gateway retries every ~2.5s) could start its OWN
-    // `page.goto()` navigation while THIS request's `fetchRawBytesThroughPage` still had
-    // a `page.evaluate(...)` fetch in flight on that same page — tearing down its JS
-    // execution context mid-await and leaving `response` as `undefined`, which surfaced
-    // as the cryptic "Cannot read properties of undefined (reading 'arrayBuffer')".
-    // Wrapping the whole sequence in one `queueSignatureRequest` call closes that gap.
     let raw;
     try {
-      raw = await queueSignatureRequest(async () => {
-        // Reuses the SAME sign+navigate machinery `/signature` already uses (this
-        // module never touches the browser/SDK internals directly) — the UNQUEUED
-        // variant, since we're already inside the queue here.
-        const signed = await generateSignedUrlUnqueued(targetUrl, query.get("user_agent") || null);
-        return fetchRawBytesThroughPage(getPage(), signed.signedUrl);
-      });
+      raw = await fetchWebcastRawBytes(uniqueId);
     } catch (e) {
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ message: `webcast fetch failed: ${e.message}` }));
       return;
     }
 
-    // DIAGNOSTIC — remove once the "not yet verified" caveat above is resolved. If
-    // `preview` reads as HTML/JSON text instead of binary garbage, TikTok rejected the
-    // request (captcha, malformed params, bot check) and returned an error PAGE with a
-    // 200 status instead of real protobuf — which is exactly what makes the connector's
-    // `pushServer` end up empty/wrong and `ws` fail with "Unexpected server response:
-    // 200" one step later.
+    // DIAGNOSTIC — keep until this route has been confirmed working against several
+    // real live rooms. If `preview` reads as HTML/JSON text instead of binary
+    // garbage, TikTok returned an error PAGE (captcha, bot check, account not live)
+    // with a 200 status instead of real protobuf.
     const preview = raw.bytes.subarray(0, 200).toString("utf8").replace(/[^\x20-\x7e]/g, ".");
     console.log(
       `[webcast] status=${raw.status} bytes=${raw.bytes.length} preview="${preview}"`,
