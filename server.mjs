@@ -95,16 +95,12 @@ try {
 // Browser state
 let browser = null;
 let page = null;
-let cdpSession = null;
 let cookies = null;
 let isInitializing = false;
 let isReady = false;
 let generationCount = 0;
 let initMethod = null;
 let lastInitTime = null;
-// Which uniqueId's `/live` page the shared session last navigated to for
-// `ensureLiveRoomContext` — see that function for why this exists.
-let currentRoomContextUniqueId = null;
 
 // Cache of page-emitted signed URLs, keyed by pathname.
 const signedUrlCache = new Map();
@@ -225,6 +221,12 @@ async function initBrowser() {
     // Add proxy if enabled
     if (PROXY_ENABLED) {
       browserArgs.push(`--proxy-server=http://${PROXY_HOST}`);
+      // Scraping-API-style proxies (scrape.do, and most others in this category)
+      // terminate TLS themselves and re-issue their own certificate — needed for
+      // their own features (JS rendering, unblocking) — which Chromium's public CA
+      // trust store rejects by default (`ERR_CERT_AUTHORITY_INVALID`, confirmed
+      // live). Only relaxed when a proxy is actually in use, not by default.
+      browserArgs.push("--ignore-certificate-errors");
       console.log(`[Server] Proxy enabled: ${PROXY_HOST}`);
     } else {
       console.log("[Server] Proxy disabled - direct connection");
@@ -244,16 +246,6 @@ async function initBrowser() {
     });
 
     page = await browser.newPage();
-    cdpSession = await page.createCDPSession();
-    await cdpSession.send("Network.enable");
-    // `Network.loadNetworkResource` (used by `fetchViaBrowserNetworkStack`) enforces
-    // the page's live CSP — confirmed live: it rejected the webcast.tiktok.com load
-    // with "CSP violation" even though `connect-src *` is present in TikTok's own
-    // response headers (checked earlier this session), so whatever's actually being
-    // evaluated here isn't that. Bypassing CSP entirely for this page sidesteps it —
-    // safe here since this page only ever does two things: sign via the SDK
-    // (page.evaluate, unaffected by CSP) and this resource load.
-    await page.setBypassCSP(true);
 
     // Registers the in-page WS bridge (see routes/ws-proxy.mjs) — must happen before
     // this page's first navigation so `evaluateOnNewDocument` covers it.
@@ -368,55 +360,6 @@ async function dismissTikTokErrorIfPresent(maxAttempts = 2) {
   return true;
 }
 
-/**
- * Navigates the shared session to the SPECIFIC room's `/@<uniqueId>/live` page before
- * signing that room's webcast requests — separate from (and doesn't replace) the
- * one-time `@zara` navigation `initWithLocalSdk` does at startup just to bootstrap the
- * SDK. Investigated live: every request so far has been signed from that same fixed,
- * generic profile page regardless of which room is actually being connected to, while
- * the signed request targets a completely different host (`webcast.tiktok.com`).
- * TikTok's anti-bot state (msToken rotation, acrawler heartbeat) is plausibly bound to
- * the page/JS-bundle context it was generated from — a signature can be well-formed
- * (the SDK call itself succeeds) and still get rejected server-side if it doesn't
- * correspond to a real live-viewing session. This is the first thing to try before any
- * more TikTok-side param/header guessing.
- *
- * Only re-navigates when the target user actually changes — a full navigation on every
- * single fetch would blow the ~15s warm-session budget this whole design exists to
- * avoid. SDK injection (`evaluateOnNewDocument`) and request interception both already
- * persist across navigations (see the comment above the `dismissTikTokErrorIfPresent`
- * call in `initWithLocalSdk`), so nothing needs to be rewired here for that.
- */
-async function ensureLiveRoomContext(uniqueId) {
-  if (!uniqueId || uniqueId === currentRoomContextUniqueId) return;
-
-  console.log(`[Server] Navigating to live room context for @${uniqueId}...`);
-  await page.goto(`https://www.tiktok.com/@${uniqueId}/live`, {
-    waitUntil: "domcontentloaded",
-    timeout: 60000,
-  });
-  await dismissTikTokErrorIfPresent();
-
-  // Reuses the same readiness check `initWithLocalSdk` uses after its own navigation —
-  // if the SDK isn't alive on this new page, throw the same message
-  // `_generateSignedUrlInternal`'s recovery path already looks for ("SDK not
-  // initialized|SDK not ready"), so a bad navigation self-heals via the existing
-  // close+reinit retry instead of silently signing against a half-loaded page.
-  const sdkStatus = await page.evaluate(() => {
-    const hasAcrawler = !!window.byted_acrawler;
-    const hasFrontierSign =
-      hasAcrawler && typeof window.byted_acrawler.frontierSign === "function";
-    return { hasAcrawler, hasFrontierSign };
-  });
-  if (!sdkStatus.hasFrontierSign) {
-    throw new Error(
-      `SDK not ready after navigating to @${uniqueId}/live: ${JSON.stringify(sdkStatus)}`,
-    );
-  }
-
-  currentRoomContextUniqueId = uniqueId;
-  console.log(`[Server] Live room context ready for @${uniqueId}`);
-}
 
 /**
  * Initialize with TikTok page context and LOCAL SDK
@@ -513,6 +456,20 @@ async function initWithLocalSdk() {
   console.log("[Server] SDK status:", JSON.stringify(sdkStatus));
 
   if (!sdkStatus.hasFrontierSign) {
+    // DIAGNOSTIC — investigating a proxy-specific init failure: capture what the page
+    // actually looks like (title + visible text) when the SDK check fails, to tell
+    // apart "TikTok served a real page but our injection lost a race" from "TikTok (or
+    // the proxy) served something else entirely (block page, captcha, error page)".
+    try {
+      const pageState = await page.evaluate(() => ({
+        title: document.title,
+        url: location.href,
+        bodyPreview: (document.body?.innerText || "").slice(0, 300),
+      }));
+      console.log("[Server] Page state at SDK failure:", JSON.stringify(pageState));
+    } catch (e) {
+      console.log("[Server] Could not capture page state:", e.message);
+    }
     throw new Error(
       `Local SDK failed to initialize: ${JSON.stringify(sdkStatus)}`,
     );
@@ -551,12 +508,10 @@ async function initWithLocalSdk() {
 
 async function closeBrowser() {
   isReady = false;
-  cdpSession = null;
   cookies = null;
   generationCount = 0;
   initMethod = null;
   lastInitTime = null;
-  currentRoomContextUniqueId = null;
 
   if (browser) {
     try {
@@ -651,102 +606,49 @@ async function generateSignedUrl(
 }
 
 /**
- * Signs `targetUrl` (browser+SDK, needs the shared page) and then fetches it as a
- * PLAIN NODE.JS request (`undici`'s global `fetch`, same one the earlier live
- * diagnostic (`node -e "fetch('https://www.tiktok.com')..."`) confirmed reaches
- * TikTok fine from this machine) — not through `page.evaluate`. CORS is a
- * BROWSER-ONLY restriction on code running inside a page; it was never going to
- * apply to a request Node itself makes. The two earlier attempts (injected
- * `fetch()` in the page, then navigate-and-intercept to dodge that same CORS wall)
- * were both solving a problem that doesn't exist once the actual HTTP call happens
- * server-side instead of browser-side.
+ * Fetches the RAW bytes of a signed URL through the browser page — the protobuf-safe
+ * sibling of the existing `/fetch` route, which JSON-parses the response and would
+ * corrupt binary data. Bytes cross the `page.evaluate` boundary as base64, since
+ * Puppeteer serializes return values as JSON.
  *
- * Runs as ONE queue slot (sign + fetch together) for the same reason the very first
- * fix here needed to: two overlapping `/connect` retries must not let one's
- * `page.goto()` (inside `generateSignedUrlUnqueued`) interrupt the OTHER's signing
- * mid-flight on the shared page.
+ * This IS a page-JS `fetch()`, not a Node-side one. A whole detour was taken this
+ * session (Node's own `fetch` → CDP's `Network.loadNetworkResource`) on the theory
+ * that this would hit CORS — confirmed live, directly, that it's the correct approach
+ * after all: this exact function, unmodified, against a real live room, returns real
+ * TikTok protobuf (200, real bytes). Whatever caused the earlier "Failed to fetch"
+ * observation, it wasn't a structural CORS block on this call.
  */
-/**
- * Loads `url` through the BROWSER's own network stack via CDP's
- * `Network.loadNetworkResource` — not `page.evaluate(fetch(...))` (subject to CORS,
- * confirmed dead end: "Failed to fetch" every time) and not Node's own `fetch`
- * (confirmed dead end too: headers and query params were both fixed in two earlier
- * commits, `619953b`/`30edf68`, with ZERO change in symptom — always 200, always 0
- * bytes, no matter what was sent. That total invariance to payload changes is the
- * signature of a block keyed on something Node's `fetch` (undici) can never match:
- * its TLS/HTTP2 handshake fingerprint, which differs from Chromium's regardless of
- * what headers ride on top of it).
- *
- * `Network.loadNetworkResource` performs the request using Chromium's real network
- * stack — same TLS fingerprint the SDK's own signing navigation already gets through
- * with — but it isn't page-JS `fetch()`, so it was never subject to CORS either.
- * `includeCredentials: true` carries the session's real cookies.
- */
-async function fetchViaBrowserNetworkStack(url) {
-  const { frameTree } = await cdpSession.send("Page.getFrameTree");
-  const frameId = frameTree.frame.id;
-  const { resource } = await cdpSession.send("Network.loadNetworkResource", {
-    frameId,
-    url,
-    options: { disposition: "Diskless", includeCredentials: true, disableCache: true },
-  });
-  if (!resource.success || !resource.stream) {
-    return {
-      status: resource.httpStatusCode || 0,
-      bytes: Buffer.alloc(0),
-      netError: resource.netErrorName || "unknown",
-    };
-  }
-  const chunks = [];
-  let eof = false;
-  while (!eof) {
-    const chunk = await cdpSession.send("IO.read", {
-      handle: resource.stream,
-      size: 1_000_000,
-    });
-    chunks.push(
-      chunk.base64Encoded
-        ? Buffer.from(chunk.data, "base64")
-        : Buffer.from(chunk.data, "utf-8"),
-    );
-    eof = chunk.eof;
-  }
-  await cdpSession.send("IO.close", { handle: resource.stream }).catch(() => {});
-  return { status: resource.httpStatusCode || 200, bytes: Buffer.concat(chunks) };
+async function fetchRawBytesThroughPage(signedUrl) {
+  const result = await page.evaluate(async (url) => {
+    try {
+      const response = await fetch(url, {
+        credentials: "include",
+        headers: { Accept: "application/protobuf,application/json" },
+      });
+      const buf = await response.arrayBuffer();
+      let binary = "";
+      const bytes = new Uint8Array(buf);
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      return { status: response.status, bodyBase64: btoa(binary) };
+    } catch (e) {
+      return { error: e.message };
+    }
+  }, signedUrl);
+
+  if (result.error) throw new Error(result.error);
+  return { status: result.status, bytes: Buffer.from(result.bodyBase64, "base64") };
 }
 
-async function fetchWebcastRawBytes(targetUrl, userAgent, uniqueId) {
+/**
+ * Signs `targetUrl` (browser+SDK, needs the shared page) then fetches the signed URL
+ * through that SAME page. Runs as ONE queue slot (sign + fetch together) so an
+ * overlapping request's signing can't interleave with this one's fetch on the shared
+ * page.
+ */
+async function fetchWebcastRawBytes(targetUrl, userAgent) {
   return queueSignatureRequest(async () => {
-    // Must run inside this same queue slot, before signing — an overlapping request's
-    // navigation must not interrupt this one's signing mid-flight, same reasoning as
-    // signing+fetching already being one slot together (see this function's own
-    // existing header comment below).
-    await ensureLiveRoomContext(uniqueId);
     const signed = await _generateSignedUrlInternal(targetUrl, userAgent, null);
-    // Extra headers set here apply session-wide, so they're set right before the
-    // load and cleared right after — nothing else runs concurrently on this session
-    // (this whole function is one queue slot), but no reason to leave them lingering
-    // for later signing navigations.
-    await cdpSession.send("Network.setExtraHTTPHeaders", {
-      headers: {
-        Referer: "https://www.tiktok.com/",
-        Origin: "https://www.tiktok.com",
-        "Sec-Fetch-Site": "same-site",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-      },
-    });
-    try {
-      const result = await fetchViaBrowserNetworkStack(signed.signedUrl);
-      if (result.netError) {
-        console.log(`[webcast] CDP load netError=${result.netError}`);
-      }
-      return result;
-    } finally {
-      await cdpSession
-        .send("Network.setExtraHTTPHeaders", { headers: {} })
-        .catch(() => {});
-    }
+    return fetchRawBytesThroughPage(signed.signedUrl);
   });
 }
 
@@ -1102,10 +1004,8 @@ const tryHandleWebcastRoute = createWebcastRoutes({
   initBrowser,
   ensurePageReady,
   generateSignedUrl,
-  // `/webcast/rooms/:id/connect` signs the URL through the browser/SDK as always,
-  // then loads it through the browser's own network stack via CDP — see
-  // `fetchViaBrowserNetworkStack`'s comment for why plain Node `fetch` (tried and
-  // measured, `619953b`/`30edf68`) and page-JS `fetch()` (CORS) both proved dead ends.
+  // `/webcast/rooms/:id/connect` signs the URL through the browser/SDK, then fetches
+  // it through that same page — see `fetchRawBytesThroughPage`'s comment above.
   fetchWebcastRawBytes,
   getCookies: () => cookies,
 });

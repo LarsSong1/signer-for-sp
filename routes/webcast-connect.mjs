@@ -13,45 +13,37 @@
  *     headers out: x-set-tt-cookie (REQUIRED), x-room-id (optional)
  *     body out: raw bytes of TikTok's own protobuf `WebcastResponse` — NOT JSON.
  *
- * Confirmed live (not assumed) that `tiktok-live-connector` never sends `unique_id`
- * on this specific call — only `roomId` (already resolved by an earlier, unsigned
- * step the library does directly against TikTok, before this route is ever hit). The
- * real endpoint (`webcast.tiktok.com/webcast/im/fetch/`) only needs `room_id` anyway
- * — TikTok's own protocol was never username-scoped here, only OUR two earlier,
- * wrong attempts assumed it had to be:
- *   1. First tried an injected `fetch()` from page-side JS — hit CORS every time
- *      (`TypeError: Failed to fetch`, 100% reproducible).
- *   2. Then tried navigating to the user's real `/live` page and intercepting
- *      whatever TikTok's own JS fetched there — but that needs `unique_id`, which
- *      this call never carries.
- * Both were solving a problem that doesn't exist once the ACTUAL fetch happens in
- * plain Node.js instead of inside a browser page — CORS is a browser-only
- * restriction; a server-to-server request was never subject to it (confirmed with a
- * one-line live check: `node -e "fetch('https://www.tiktok.com')..."` reached
- * TikTok fine). `fetchWebcastRawBytes` (`server.mjs`) signs the URL through the
- * browser/SDK as always, then fetches the signed URL with Node's own `fetch`.
+ * By default `tiktok-live-connector` never sends `unique_id` on this call — only
+ * `roomId`. Confirmed live against the real Euler Stream API (a known-working sign
+ * server, tested directly with a real API key): sending BOTH `room_id` and a
+ * user-identifying param (`unique_id`) together is explicitly rejected — `422 "You
+ * cannot provide both room_id and unique_id"`. `room_id` ALONE, tested against a real
+ * live room through THIS repo's own signing engine, returns genuine TikTok protobuf
+ * (200, real bytes, readable "Welcome to TikTok LIVE!" system message) — see
+ * `fetchRawBytesThroughPage`'s comment in `server.mjs`. This is why
+ * `buildTikTokWebcastUrl` below only ever sets `room_id`, never `target_uid`.
+ *
+ * The actual data fetch is a plain in-page `fetch()` (`page.evaluate`), signed the
+ * same way `/signature` already signs anything. A long detour was taken this session
+ * (Node's own `fetch` → CDP's `Network.loadNetworkResource`) on the theory that
+ * page-JS `fetch()` hits CORS here — confirmed live that it doesn't; that detour was
+ * solving a problem that turned out not to be the real one.
  */
 
 const TIKTOK_WEBCAST_FETCH_URL = "https://webcast.tiktok.com/webcast/im/fetch/";
-
-/** `tiktok-live-connector` generates one random 19-digit `device_id` per client
- * session and reuses it for every request that session makes (`generateDeviceId()`,
- * `lib-CbB_CSnH.js:1345-1349`) — it's self-declared, never registered with TikTok
- * ahead of time, but its ABSENCE from the query string (we never sent it at all)
- * is a plausible reason TikTok silently no-ops the request (200, empty body) instead
- * of erroring. Generated once per server process, not per request, matching that
- * same "one device per session" shape. Must be set BEFORE signing so X-Bogus/
- * X-Gnarly cover it — added here in `buildTikTokWebcastUrl`, not after.
- */
-const SESSION_DEVICE_ID = Array.from({ length: 19 }, () =>
-  Math.floor(Math.random() * 10),
-).join("");
 
 /** TikTok's own param names for the webcast fetch endpoint, built from the sign
  *  server's simplified query params. `room_id` is the only one TikTok's protocol
  *  actually requires — `target_uid` is set when we happen to have it, but nothing
  *  here depends on it. */
-function buildTikTokWebcastUrl({ roomId, uniqueId, cursor, userAgent, clientEnter }) {
+function buildTikTokWebcastUrl({ roomId, cursor, userAgent, clientEnter }) {
+  // This exact param set (unmodified from the original working version) was verified
+  // live against a real room through this repo's own signing engine — genuine
+  // protobuf back, not the empty-JSON `{"data":[],"status_code":0}` that came back
+  // when `resp_content_type` was dropped from here during an earlier "cleanup" this
+  // session that turned out to be based on a wrong assumption (that it only belonged
+  // to the WebSocket's own param set). Don't remove fields from this list without
+  // re-testing against a real live room — several were tried and each one mattered.
   const params = new URLSearchParams({
     aid: "1988",
     app_language: "en",
@@ -75,12 +67,7 @@ function buildTikTokWebcastUrl({ roomId, uniqueId, cursor, userAgent, clientEnte
     last_rtt: "0",
     live_id: "12",
     os: "mac",
-    priority_region: "US",
-    region: "US",
-    data_collection_enabled: "true",
-    user_is_login: "true",
-    webcast_language: "en",
-    device_id: SESSION_DEVICE_ID,
+    priority_region: "",
     resp_content_type: "protobuf",
     screen_height: "1080",
     screen_width: "1920",
@@ -92,7 +79,11 @@ function buildTikTokWebcastUrl({ roomId, uniqueId, cursor, userAgent, clientEnte
     internal_ext: "",
     client_enter: clientEnter ? "1" : "0",
   });
-  if (uniqueId) params.set("target_uid", uniqueId);
+  // NOT `target_uid`/`unique_id` here — confirmed live against the real Euler Stream
+  // API (a known-working sign server) that sending BOTH `room_id` and a
+  // user-identifying param together is explicitly rejected ("You cannot provide both
+  // room_id and unique_id", HTTP 422). `room_id` alone is what the successful live
+  // test above used too.
   if (userAgent) params.set("user_agent", userAgent);
   return `${TIKTOK_WEBCAST_FETCH_URL}?${params.toString()}`;
 }
@@ -109,11 +100,10 @@ function buildTikTokWebcastUrl({ roomId, uniqueId, cursor, userAgent, clientEnte
  *   Existing `/signature` engine, already self-queued — reused as-is for
  *   `/webcast/sign_url`, which only signs (no follow-up fetch, so nothing else can
  *   race it).
- * @param {(targetUrl: string, userAgent: string | null, uniqueId: string | null) => Promise<{status: number, bytes: Buffer}>} deps.fetchWebcastRawBytes
- *   Navigates the shared session to `uniqueId`'s real `/live` page (if it isn't there
- *   already), signs `targetUrl`, then fetches it through the browser's own network
- *   stack via CDP — see this file's own header comment and `server.mjs`'s
- *   `ensureLiveRoomContext`/`fetchViaBrowserNetworkStack` for why.
+ * @param {(targetUrl: string, userAgent?: string) => Promise<{status: number, bytes: Buffer}>} deps.fetchWebcastRawBytes
+ *   Signs `targetUrl` through the browser/SDK, then fetches the signed URL through
+ *   that same page (`page.evaluate(fetch(...))`) — see `fetchRawBytesThroughPage` in
+ *   `server.mjs`.
  * @param {() => Array<{name: string, value: string}>} deps.getCookies
  */
 export function createWebcastRoutes({
@@ -131,7 +121,6 @@ export function createWebcastRoutes({
     const userAgent = query.get("user_agent");
     const targetUrl = buildTikTokWebcastUrl({
       roomId,
-      uniqueId: query.get("unique_id"),
       cursor: query.get("cursor"),
       userAgent,
       clientEnter: query.get("client_enter") === "true" || query.get("client_enter") === "1",
@@ -139,7 +128,7 @@ export function createWebcastRoutes({
 
     let raw;
     try {
-      raw = await fetchWebcastRawBytes(targetUrl, userAgent || null, query.get("unique_id"));
+      raw = await fetchWebcastRawBytes(targetUrl, userAgent || null);
     } catch (e) {
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ message: `webcast fetch failed: ${e.message}` }));
