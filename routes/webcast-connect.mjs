@@ -8,25 +8,76 @@
  * `TikTokLIVERoomsApi.fetchWebcastURL`):
  *
  *   GET /webcast/rooms/:roomId/connect
- *     query:  unique_id, cursor, user_agent, client_enter, country, platform, client
+ *     query:  cursor, user_agent, client_enter, country, platform, client
  *     headers in: x-oauth-token / x-cookie-header (optional, session auth)
  *     headers out: x-set-tt-cookie (REQUIRED), x-room-id (optional)
  *     body out: raw bytes of TikTok's own protobuf `WebcastResponse` — NOT JSON.
  *
- * ⚠️ The first version of this route built TikTok's `webcast/im/fetch` URL by hand,
- * signed it the same way `/signature` does, and fetched it with an injected
- * `fetch()` call from page-side JS. Verified LIVE (not assumed) that this never
- * worked: TikTok's CORS policy on that endpoint rejects a cross-origin fetch issued
- * by injected code — confirmed by isolating the failure with a diagnostic pass
- * (`fetch() rejected: TypeError: Failed to fetch`, 100% of attempts, not
- * intermittent — ruling out flakiness or a signing bug). `handleConnect` now instead
- * navigates to the target user's real LIVE page and captures the raw bytes of
- * whatever matching request TikTok's OWN first-party JS makes there (see
- * `fetchWebcastRawBytes` in `server.mjs`) — response bytes read via Puppeteer's CDP
- * layer aren't subject to the page's own fetch()-level CORS enforcement, so this
- * sidesteps the wall instead of fighting it. Still not diffed against Euler Stream's
- * own reference implementation, so treat as freshly-live-tested, not battle-hardened.
+ * Confirmed live (not assumed) that `tiktok-live-connector` never sends `unique_id`
+ * on this specific call — only `roomId` (already resolved by an earlier, unsigned
+ * step the library does directly against TikTok, before this route is ever hit). The
+ * real endpoint (`webcast.tiktok.com/webcast/im/fetch/`) only needs `room_id` anyway
+ * — TikTok's own protocol was never username-scoped here, only OUR two earlier,
+ * wrong attempts assumed it had to be:
+ *   1. First tried an injected `fetch()` from page-side JS — hit CORS every time
+ *      (`TypeError: Failed to fetch`, 100% reproducible).
+ *   2. Then tried navigating to the user's real `/live` page and intercepting
+ *      whatever TikTok's own JS fetched there — but that needs `unique_id`, which
+ *      this call never carries.
+ * Both were solving a problem that doesn't exist once the ACTUAL fetch happens in
+ * plain Node.js instead of inside a browser page — CORS is a browser-only
+ * restriction; a server-to-server request was never subject to it (confirmed with a
+ * one-line live check: `node -e "fetch('https://www.tiktok.com')..."` reached
+ * TikTok fine). `fetchWebcastRawBytes` (`server.mjs`) signs the URL through the
+ * browser/SDK as always, then fetches the signed URL with Node's own `fetch`.
  */
+
+const TIKTOK_WEBCAST_FETCH_URL = "https://webcast.tiktok.com/webcast/im/fetch/";
+
+/** TikTok's own param names for the webcast fetch endpoint, built from the sign
+ *  server's simplified query params. `room_id` is the only one TikTok's protocol
+ *  actually requires — `target_uid` is set when we happen to have it, but nothing
+ *  here depends on it. */
+function buildTikTokWebcastUrl({ roomId, uniqueId, cursor, userAgent, clientEnter }) {
+  const params = new URLSearchParams({
+    aid: "1988",
+    app_language: "en",
+    app_name: "tiktok_web",
+    browser_language: "en-US",
+    browser_name: "Mozilla",
+    browser_online: "true",
+    browser_platform: "MacIntel",
+    browser_version: "5.0",
+    channel: "tiktok_web",
+    cookie_enabled: "true",
+    device_platform: "web_pc",
+    focus_state: "true",
+    from_page: "user",
+    history_len: "2",
+    is_fullscreen: "false",
+    is_page_visible: "true",
+    did_rule: "3",
+    fetch_rule: "1",
+    identity: "audience",
+    last_rtt: "0",
+    live_id: "12",
+    os: "mac",
+    priority_region: "",
+    resp_content_type: "protobuf",
+    screen_height: "1080",
+    screen_width: "1920",
+    tz_name: "America/New_York",
+    root_referer: "https://www.tiktok.com/",
+    referer: "https://www.tiktok.com/",
+    room_id: roomId,
+    cursor: cursor || "",
+    internal_ext: "",
+    client_enter: clientEnter ? "1" : "0",
+  });
+  if (uniqueId) params.set("target_uid", uniqueId);
+  if (userAgent) params.set("user_agent", userAgent);
+  return `${TIKTOK_WEBCAST_FETCH_URL}?${params.toString()}`;
+}
 
 /**
  * Registers the two new routes on the existing HTTP router. Called once from
@@ -38,12 +89,11 @@
  * @param {() => Promise<void>} deps.ensurePageReady
  * @param {(targetUrl: string, userAgent?: string) => Promise<any>} deps.generateSignedUrl
  *   Existing `/signature` engine, already self-queued — reused as-is for
- *   `/webcast/sign_url`, which only signs (no follow-up page fetch, so nothing else
- *   can race it).
- * @param {(uniqueId: string) => Promise<{status: number, bytes: Buffer}>} deps.fetchWebcastRawBytes
- *   Navigates to `@uniqueId`'s real LIVE page and returns the raw bytes TikTok's own
- *   page naturally received from `webcast/im/fetch` — see this file's own header
- *   comment for why this replaced the sign+fetch approach.
+ *   `/webcast/sign_url`, which only signs (no follow-up fetch, so nothing else can
+ *   race it).
+ * @param {(targetUrl: string, userAgent?: string) => Promise<{status: number, bytes: Buffer}>} deps.fetchWebcastRawBytes
+ *   Signs `targetUrl` and fetches it with Node's own `fetch` — see this file's own
+ *   header comment for why that replaced the two earlier, browser-side attempts.
  * @param {() => Array<{name: string, value: string}>} deps.getCookies
  */
 export function createWebcastRoutes({
@@ -58,19 +108,18 @@ export function createWebcastRoutes({
     await initBrowser();
     await ensurePageReady();
 
-    const uniqueId = query.get("unique_id");
-    if (!uniqueId) {
-      // DIAGNOSTIC — what the gateway actually sent, so the next failure says
-      // something instead of another guess at the param name.
-      console.log(`[webcast] /connect for roomId=${roomId} — full query: ${query.toString()}`);
-      res.writeHead(400, { "content-type": "application/json" });
-      res.end(JSON.stringify({ message: `unique_id query param is required (got: ${query.toString()})` }));
-      return;
-    }
+    const userAgent = query.get("user_agent");
+    const targetUrl = buildTikTokWebcastUrl({
+      roomId,
+      uniqueId: query.get("unique_id"),
+      cursor: query.get("cursor"),
+      userAgent,
+      clientEnter: query.get("client_enter") === "true" || query.get("client_enter") === "1",
+    });
 
     let raw;
     try {
-      raw = await fetchWebcastRawBytes(uniqueId);
+      raw = await fetchWebcastRawBytes(targetUrl, userAgent || null);
     } catch (e) {
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ message: `webcast fetch failed: ${e.message}` }));
@@ -79,8 +128,8 @@ export function createWebcastRoutes({
 
     // DIAGNOSTIC — keep until this route has been confirmed working against several
     // real live rooms. If `preview` reads as HTML/JSON text instead of binary
-    // garbage, TikTok returned an error PAGE (captcha, bot check, account not live)
-    // with a 200 status instead of real protobuf.
+    // garbage, TikTok returned an error PAGE (captcha, bot check, account not live,
+    // malformed params) with a 200 status instead of real protobuf.
     const preview = raw.bytes.subarray(0, 200).toString("utf8").replace(/[^\x20-\x7e]/g, ".");
     console.log(
       `[webcast] status=${raw.status} bytes=${raw.bytes.length} preview="${preview}"`,

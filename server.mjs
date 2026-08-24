@@ -106,11 +106,6 @@ let lastInitTime = null;
 const signedUrlCache = new Map();
 const SIGNED_CACHE_MAX_AGE_MS = 60_000;
 
-// Same idea as `signedUrlCache`, but for the RAW RESPONSE BYTES of a matching request
-// — see `fetchWebcastRawBytes`'s own comment for why this exists instead of an
-// injected `fetch()` call.
-const webcastBytesCache = new Map();
-
 // Auto-refresh configuration to avoid blocks
 const MAX_GENERATIONS_BEFORE_REFRESH =
   Number(process.env.MAX_GENERATIONS_BEFORE_REFRESH) || 500; // Restart browser after this many signatures
@@ -270,28 +265,6 @@ async function initBrowser() {
           url: u,
           capturedAt: Date.now(),
           referer: request.headers().referer || "",
-        });
-      } catch (e) {}
-    });
-
-    // Same passive-capture idea, for the RESPONSE side — `webcast/im/fetch` (the
-    // follower-chat connect endpoint) can't be re-fetched by injected page code:
-    // TikTok's own page triggers it as a first-party request, but an in-page
-    // `fetch(sameUrl)` from OUR code hits a plain CORS wall (confirmed live —
-    // "TypeError: Failed to fetch" on every single attempt, not intermittently).
-    // `response.buffer()` reads via CDP, which isn't subject to the page's own
-    // fetch()-level CORS enforcement, so watching whatever request TikTok's page
-    // makes on its own and reading ITS response sidesteps the problem entirely instead
-    // of trying to construct and issue the request ourselves.
-    page.on("response", async (response) => {
-      try {
-        const u = response.url();
-        if (!u.includes("/webcast/im/fetch/")) return;
-        const buf = await response.buffer();
-        webcastBytesCache.set("/webcast/im/fetch/", {
-          status: response.status(),
-          bytes: buf,
-          capturedAt: Date.now(),
         });
       } catch (e) {}
     });
@@ -611,10 +584,36 @@ async function generateSignedUrl(
   );
 }
 
-/** Queued entry point for `_fetchWebcastRawBytesViaNavigate` — see its own doc
- *  comment. Used by `/webcast/rooms/:id/connect` instead of a sign+fetch pair. */
-async function fetchWebcastRawBytes(uniqueId) {
-  return queueSignatureRequest(() => _fetchWebcastRawBytesViaNavigate(uniqueId));
+/**
+ * Signs `targetUrl` (browser+SDK, needs the shared page) and then fetches it as a
+ * PLAIN NODE.JS request (`undici`'s global `fetch`, same one the earlier live
+ * diagnostic (`node -e "fetch('https://www.tiktok.com')..."`) confirmed reaches
+ * TikTok fine from this machine) — not through `page.evaluate`. CORS is a
+ * BROWSER-ONLY restriction on code running inside a page; it was never going to
+ * apply to a request Node itself makes. The two earlier attempts (injected
+ * `fetch()` in the page, then navigate-and-intercept to dodge that same CORS wall)
+ * were both solving a problem that doesn't exist once the actual HTTP call happens
+ * server-side instead of browser-side.
+ *
+ * Runs as ONE queue slot (sign + fetch together) for the same reason the very first
+ * fix here needed to: two overlapping `/connect` retries must not let one's
+ * `page.goto()` (inside `generateSignedUrlUnqueued`) interrupt the OTHER's signing
+ * mid-flight on the shared page.
+ */
+async function fetchWebcastRawBytes(targetUrl, userAgent) {
+  return queueSignatureRequest(async () => {
+    const signed = await _generateSignedUrlInternal(targetUrl, userAgent, null);
+    const cookieHeader = (cookies || []).map((c) => `${c.name}=${c.value}`).join("; ");
+    const response = await fetch(signed.signedUrl, {
+      headers: {
+        Accept: "application/protobuf,application/json",
+        Cookie: cookieHeader,
+        "User-Agent": userAgent || currentUserAgent || "",
+      },
+    });
+    const buf = await response.arrayBuffer();
+    return { status: response.status, bytes: Buffer.from(buf) };
+  });
 }
 
 /**
@@ -703,46 +702,6 @@ async function _signViaPageIntercept(targetUrl, navigateTo, userAgent = null) {
 
   throw new Error(
     `No fresh ${targetPath} request emitted by ${navigateTo} within ${WAIT_MS / 1000}s`,
-  );
-}
-
-/**
- * Gets the RAW protobuf bytes TikTok's own live-room page naturally receives from
- * `webcast/im/fetch` for `uniqueId` — by navigating to that user's real LIVE page and
- * letting TikTok's own first-party JS make the request, instead of constructing and
- * fetching the URL ourselves (see `webcastBytesCache`'s own comment on why the
- * injected-fetch approach hits an unfixable CORS wall). Mirrors
- * `_signViaPageIntercept`'s already-proven poll-a-passively-filled-cache pattern —
- * same 15s window, same start-time watermark to reject a stale entry left over from a
- * previous call.
- *
- * Must be called through `queueSignatureRequest` — it navigates the shared page, same
- * constraint as every other function here that touches it.
- */
-async function _fetchWebcastRawBytesViaNavigate(uniqueId) {
-  await initBrowser();
-  await ensurePageReady();
-
-  const callStart = Date.now();
-  await page.goto(`https://www.tiktok.com/@${uniqueId}/live`, {
-    waitUntil: "domcontentloaded",
-    timeout: 60000,
-  });
-  await dismissTikTokErrorIfPresent();
-
-  const WAIT_MS = 15000;
-  while (Date.now() - callStart < WAIT_MS) {
-    const c = webcastBytesCache.get("/webcast/im/fetch/");
-    if (c && c.capturedAt >= callStart) {
-      cookies = await page.cookies();
-      generationCount++;
-      return { status: c.status, bytes: c.bytes };
-    }
-    await new Promise((r) => setTimeout(r, 50));
-  }
-
-  throw new Error(
-    `No /webcast/im/fetch/ response seen for @${uniqueId}/live within ${WAIT_MS / 1000}s — the account may not be live right now`,
   );
 }
 
@@ -1009,10 +968,11 @@ const tryHandleWebcastRoute = createWebcastRoutes({
   initBrowser,
   ensurePageReady,
   generateSignedUrl,
-  // `/webcast/rooms/:id/connect` now gets its raw bytes by navigating to the real
-  // live page and capturing what TikTok's own JS naturally fetches — see
-  // `fetchWebcastRawBytes`'s own comment for why the earlier sign+injected-fetch
-  // approach never actually worked (CORS, confirmed live).
+  // `/webcast/rooms/:id/connect` signs the URL through the browser/SDK as always,
+  // then fetches it with plain Node `fetch` — see `fetchWebcastRawBytes`'s own
+  // comment for why the two earlier browser-side attempts (injected fetch, then
+  // navigate-and-intercept) were both solving a CORS problem that never applied to
+  // a server-to-server request in the first place.
   fetchWebcastRawBytes,
   getCookies: () => cookies,
 });
