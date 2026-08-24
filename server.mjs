@@ -95,6 +95,7 @@ try {
 // Browser state
 let browser = null;
 let page = null;
+let cdpSession = null;
 let cookies = null;
 let isInitializing = false;
 let isReady = false;
@@ -240,6 +241,8 @@ async function initBrowser() {
     });
 
     page = await browser.newPage();
+    cdpSession = await page.createCDPSession();
+    await cdpSession.send("Network.enable");
 
     // Registers the in-page WS bridge (see routes/ws-proxy.mjs) — must happen before
     // this page's first navigation so `evaluateOnNewDocument` covers it.
@@ -487,6 +490,7 @@ async function initWithLocalSdk() {
 
 async function closeBrowser() {
   isReady = false;
+  cdpSession = null;
   cookies = null;
   generationCount = 0;
   initMethod = null;
@@ -600,42 +604,82 @@ async function generateSignedUrl(
  * `page.goto()` (inside `generateSignedUrlUnqueued`) interrupt the OTHER's signing
  * mid-flight on the shared page.
  */
+/**
+ * Loads `url` through the BROWSER's own network stack via CDP's
+ * `Network.loadNetworkResource` — not `page.evaluate(fetch(...))` (subject to CORS,
+ * confirmed dead end: "Failed to fetch" every time) and not Node's own `fetch`
+ * (confirmed dead end too: headers and query params were both fixed in two earlier
+ * commits, `619953b`/`30edf68`, with ZERO change in symptom — always 200, always 0
+ * bytes, no matter what was sent. That total invariance to payload changes is the
+ * signature of a block keyed on something Node's `fetch` (undici) can never match:
+ * its TLS/HTTP2 handshake fingerprint, which differs from Chromium's regardless of
+ * what headers ride on top of it).
+ *
+ * `Network.loadNetworkResource` performs the request using Chromium's real network
+ * stack — same TLS fingerprint the SDK's own signing navigation already gets through
+ * with — but it isn't page-JS `fetch()`, so it was never subject to CORS either.
+ * `includeCredentials: true` carries the session's real cookies.
+ */
+async function fetchViaBrowserNetworkStack(url) {
+  const { frameTree } = await cdpSession.send("Page.getFrameTree");
+  const frameId = frameTree.frame.id;
+  const { resource } = await cdpSession.send("Network.loadNetworkResource", {
+    frameId,
+    url,
+    options: { disposition: "Diskless", includeCredentials: true },
+  });
+  if (!resource.success || !resource.stream) {
+    return {
+      status: resource.httpStatusCode || 0,
+      bytes: Buffer.alloc(0),
+      netError: resource.netErrorName || "unknown",
+    };
+  }
+  const chunks = [];
+  let eof = false;
+  while (!eof) {
+    const chunk = await cdpSession.send("IO.read", {
+      handle: resource.stream,
+      size: 1_000_000,
+    });
+    chunks.push(
+      chunk.base64Encoded
+        ? Buffer.from(chunk.data, "base64")
+        : Buffer.from(chunk.data, "utf-8"),
+    );
+    eof = chunk.eof;
+  }
+  await cdpSession.send("IO.close", { handle: resource.stream }).catch(() => {});
+  return { status: resource.httpStatusCode || 200, bytes: Buffer.concat(chunks) };
+}
+
 async function fetchWebcastRawBytes(targetUrl, userAgent) {
   return queueSignatureRequest(async () => {
     const signed = await _generateSignedUrlInternal(targetUrl, userAgent, null);
-    let cookieHeader = (cookies || []).map((c) => `${c.name}=${c.value}`).join("; ");
-    // `tiktok-live-connector` always sends this as a baseline cookie for this exact
-    // route (`lib-CbB_CSnH.js` DEFAULT_HTTP_CLIENT_HEADERS) — add it if the real
-    // browser session didn't already set one itself.
-    if (!/(^|;\s*)tt-target-idc=/.test(cookieHeader)) {
-      cookieHeader = cookieHeader
-        ? `${cookieHeader}; tt-target-idc=useast1a`
-        : "tt-target-idc=useast1a";
-    }
-    // Everything below (Referer/Origin/Sec-Fetch-*/etc.) mirrors that same library's
-    // known-working default headers for `webcast.tiktok.com` requests — our previous
-    // bare {Accept,Cookie,User-Agent} was missing exactly the fetch-metadata TikTok's
-    // edge checks for, which explains the silent `200 bytes=0` (a bot-mitigation
-    // block, not a signature or parsing problem — the signature was already valid).
-    const response = await fetch(signed.signedUrl, {
+    // Extra headers set here apply session-wide, so they're set right before the
+    // load and cleared right after — nothing else runs concurrently on this session
+    // (this whole function is one queue slot), but no reason to leave them lingering
+    // for later signing navigations.
+    await cdpSession.send("Network.setExtraHTTPHeaders", {
       headers: {
-        Accept: "text/html,application/json,application/protobuf",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate",
-        Connection: "keep-alive",
-        "Cache-Control": "max-age=0",
         Referer: "https://www.tiktok.com/",
         Origin: "https://www.tiktok.com",
         "Sec-Fetch-Site": "same-site",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Ua-Mobile": "?0",
-        Cookie: cookieHeader,
-        "User-Agent": userAgent || currentUserAgent || "",
       },
     });
-    const buf = await response.arrayBuffer();
-    return { status: response.status, bytes: Buffer.from(buf) };
+    try {
+      const result = await fetchViaBrowserNetworkStack(signed.signedUrl);
+      if (result.netError) {
+        console.log(`[webcast] CDP load netError=${result.netError}`);
+      }
+      return result;
+    } finally {
+      await cdpSession
+        .send("Network.setExtraHTTPHeaders", { headers: {} })
+        .catch(() => {});
+    }
   });
 }
 
@@ -992,10 +1036,9 @@ const tryHandleWebcastRoute = createWebcastRoutes({
   ensurePageReady,
   generateSignedUrl,
   // `/webcast/rooms/:id/connect` signs the URL through the browser/SDK as always,
-  // then fetches it with plain Node `fetch` — see `fetchWebcastRawBytes`'s own
-  // comment for why the two earlier browser-side attempts (injected fetch, then
-  // navigate-and-intercept) were both solving a CORS problem that never applied to
-  // a server-to-server request in the first place.
+  // then loads it through the browser's own network stack via CDP — see
+  // `fetchViaBrowserNetworkStack`'s comment for why plain Node `fetch` (tried and
+  // measured, `619953b`/`30edf68`) and page-JS `fetch()` (CORS) both proved dead ends.
   fetchWebcastRawBytes,
   getCookies: () => cookies,
 });
