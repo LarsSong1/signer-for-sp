@@ -34,6 +34,19 @@
 
 const TIKTOK_WEBCAST_FETCH_URL = "https://webcast.tiktok.com/webcast/im/fetch/";
 
+/** `tiktok-live-connector` generates one random 19-digit `device_id` per client
+ * session and reuses it for every request that session makes (`generateDeviceId()`,
+ * `lib-CbB_CSnH.js:1345-1349`) — it's self-declared, never registered with TikTok
+ * ahead of time, but its ABSENCE from the query string (we never sent it at all)
+ * is a plausible reason TikTok silently no-ops the request (200, empty body) instead
+ * of erroring. Generated once per server process, not per request, matching that
+ * same "one device per session" shape. Must be set BEFORE signing so X-Bogus/
+ * X-Gnarly cover it — added here in `buildTikTokWebcastUrl`, not after.
+ */
+const SESSION_DEVICE_ID = Array.from({ length: 19 }, () =>
+  Math.floor(Math.random() * 10),
+).join("");
+
 /** TikTok's own param names for the webcast fetch endpoint, built from the sign
  *  server's simplified query params. `room_id` is the only one TikTok's protocol
  *  actually requires — `target_uid` is set when we happen to have it, but nothing
@@ -62,7 +75,12 @@ function buildTikTokWebcastUrl({ roomId, uniqueId, cursor, userAgent, clientEnte
     last_rtt: "0",
     live_id: "12",
     os: "mac",
-    priority_region: "",
+    priority_region: "US",
+    region: "US",
+    data_collection_enabled: "true",
+    user_is_login: "true",
+    webcast_language: "en",
+    device_id: SESSION_DEVICE_ID,
     resp_content_type: "protobuf",
     screen_height: "1080",
     screen_width: "1920",
