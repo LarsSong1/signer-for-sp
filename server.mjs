@@ -284,7 +284,7 @@ async function initBrowser() {
     // reenvía también cualquier mensaje de tipo error/warning, no sólo los [SP-WS].
     page.on("console", (msg) => {
       const text = msg.text();
-      if (text.startsWith("[SP-WS]")) {
+      if (text.startsWith("[SP-WS]") || text.startsWith("[SP-FETCH]")) {
         console.log("[Server]", text);
         return;
       }
@@ -743,15 +743,31 @@ async function fetchRawBytesThroughPage(signedUrl) {
     // Fire-and-forget a propósito: no confiamos en lo que esta promesa resuelva ni en
     // si rechaza (ver el comentario de arriba) — sólo nos interesa que el pedido salga
     // por la red; la respuesta real se captura del lado de Puppeteer.
+    //
+    // DIAGNOSTIC — logueamos si la propia promesa de fetch() alguna vez resuelve o
+    // rechaza, del lado de la página (esto SÍ se reenvía a la terminal ahora, ver el
+    // prefijo [SP-FETCH] en el listener de consola).
+    console.log("[SP-FETCH] disparando fetch a", url.slice(0, 80));
     fetch(url, {
       credentials: "include",
       headers: { Accept: "application/protobuf,application/json" },
-    }).catch(() => {});
+    })
+      .then((r) => console.log("[SP-FETCH] fetch() resolvió, status=", r && r.status))
+      .catch((e) => console.log("[SP-FETCH] fetch() rechazó:", e && e.message));
   }, signedUrl);
 
   let response;
   try {
-    response = await responsePromise;
+    // Guardia dura: si `response.buffer()` (o cualquier otra cosa acá) se cuelga sin
+    // avisar, esto libera el slot de la cola en vez de trabarla para siempre — pasó
+    // en la vuelta anterior (después de "continue() sin tirar error" no salió nada
+    // más nunca, ni éxito ni timeout).
+    response = await Promise.race([
+      responsePromise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("watchdog: 20s sin resolver")), 20000),
+      ),
+    ]);
   } catch (e) {
     page.off("response", onAnyResponse);
     page.off("requestfailed", onAnyRequestFailed);
@@ -765,12 +781,18 @@ async function fetchRawBytesThroughPage(signedUrl) {
       `— pedidos fallidos:`,
       JSON.stringify(failedDuringWait.slice(0, 20)),
     );
-    throw new Error(`no llegó ninguna respuesta de red que matchee dentro de 15s: ${e.message}`);
+    throw new Error(`no llegó ninguna respuesta de red que matchee: ${e.message}`);
   }
   page.off("response", onAnyResponse);
   page.off("requestfailed", onAnyRequestFailed);
 
-  const buf = await response.buffer();
+  console.log(`[webcast] responsePromise resolvió — status=${response.status()}, bajando el cuerpo...`);
+  const buf = await Promise.race([
+    response.buffer(),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("watchdog: response.buffer() no terminó en 10s")), 10000),
+    ),
+  ]);
   return { status: response.status(), bytes: buf };
 }
 
