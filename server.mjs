@@ -650,10 +650,22 @@ async function fetchRawBytesThroughPage(signedUrl) {
   // UN pedido de este tipo en vuelo a la vez (mismo slot de `queueSignatureRequest`
   // que ya serializa firma+fetch), así que matchear sólo por pathname es seguro.
   const seenDuringWait = [];
+  const failedDuringWait = [];
   const onAnyResponse = (res) => {
     seenDuringWait.push(res.url());
   };
+  const onAnyRequestFailed = (req) => {
+    // Confirmado por curl desde la propia VM: la red llega bien a webcast.tiktok.com
+    // (200 real). Si acá aparece algo para esa URL, es un bloqueo del LADO DEL
+    // NAVEGADOR (CSP es el candidato principal) — nunca llega a intentar la red.
+    failedDuringWait.push({
+      url: req.url(),
+      resourceType: req.resourceType(),
+      errorText: req.failure()?.errorText,
+    });
+  };
   page.on("response", onAnyResponse);
+  page.on("requestfailed", onAnyRequestFailed);
 
   const responsePromise = page.waitForResponse(
     (res) => res.url().includes("/webcast/im/fetch/"),
@@ -675,16 +687,21 @@ async function fetchRawBytesThroughPage(signedUrl) {
     response = await responsePromise;
   } catch (e) {
     page.off("response", onAnyResponse);
+    page.off("requestfailed", onAnyRequestFailed);
     // DIAGNOSTIC — si esto también da timeout, esta lista dice si hubo CUALQUIER
     // actividad de red mientras esperábamos (confirma/descarta que el pedido ni
-    // siquiera salió, en vez de sólo el nuestro no matcheando).
+    // siquiera salió, en vez de sólo el nuestro no matcheando), y la de fallos dice
+    // si el navegador lo bloqueó antes de intentar la red (CSP, etc.).
     console.log(
       `[webcast] timeout esperando /webcast/im/fetch/ — respuestas vistas mientras tanto:`,
       JSON.stringify(seenDuringWait.slice(0, 20)),
+      `— pedidos fallidos:`,
+      JSON.stringify(failedDuringWait.slice(0, 20)),
     );
     throw new Error(`no llegó ninguna respuesta de red que matchee dentro de 15s: ${e.message}`);
   }
   page.off("response", onAnyResponse);
+  page.off("requestfailed", onAnyRequestFailed);
 
   const buf = await response.buffer();
   return { status: response.status(), bytes: buf };
