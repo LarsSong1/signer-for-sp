@@ -266,9 +266,27 @@ async function initBrowser() {
     // Forwards the bridge's own [SP-WS] diagnostic console.log calls (see
     // routes/ws-proxy.mjs) to this terminal — otherwise they're only visible in the
     // headless browser's own console, which nothing reads.
+    //
+    // DIAGNOSTIC — este filtro descartaba TODO lo demás en silencio, incluido
+    // cualquier error real que Chrome loguee a consola (un bloqueo de CSP se reporta
+    // EXACTAMENTE así: "Refused to connect to '...' because it violates the following
+    // Content Security Policy directive..."). Dado que la petición a webcast/im/fetch
+    // no deja rastro en ningún otro lado (ni response, ni requestfailed, ni nuestro
+    // propio interceptor), esto puede ser la señal real que nos faltaba ver. Se
+    // reenvía también cualquier mensaje de tipo error/warning, no sólo los [SP-WS].
     page.on("console", (msg) => {
       const text = msg.text();
-      if (text.startsWith("[SP-WS]")) console.log("[Server]", text);
+      if (text.startsWith("[SP-WS]")) {
+        console.log("[Server]", text);
+        return;
+      }
+      const type = msg.type();
+      if (type === "error" || type === "warning") {
+        console.log(`[webcast] console.${type}:`, text.slice(0, 500));
+      }
+    });
+    page.on("pageerror", (err) => {
+      console.log(`[webcast] pageerror:`, String(err).slice(0, 500));
     });
 
     // Permanent passive listener: every signed request the page emits gets
