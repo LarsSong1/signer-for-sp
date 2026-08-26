@@ -687,113 +687,39 @@ async function generateSignedUrl(
 /**
  * Fetches the RAW bytes of a signed URL through the browser page — the protobuf-safe
  * sibling of the existing `/fetch` route, which JSON-parses the response and would
- * corrupt binary data.
+ * corrupt binary data. Bytes cross the `page.evaluate` boundary as base64, since
+ * Puppeteer serializes return values as JSON.
  *
- * CANDIDATO SIN PROBAR TODAVÍA (ver el historial de diagnóstico justo antes de este
- * cambio, no commiteado hasta confirmarlo en vivo): confirmado con evidencia real que
- * NINGUNA de las dos formas de fetch de la página sirve hoy para esta llamada en
- * particular —
- *   1. El `fetch` de la página, ya parchado por el propio SDK anti-bot de TikTok (lo
- *      necesita para sus contadores totalFetchRequests/interceptedFetchRequests),
- *      resuelve en `undefined` en vez de devolver el `Response` real.
- *   2. El fetch NATIVO real, capturado antes de que ese parche pudiera aplicarse
- *      (`window.__streampackNativeFetch`), rechaza con "Failed to fetch" — un fallo de
- *      CORS/red a nivel de JS.
- * Que el (1) resuelva ALGO (aunque sea `undefined`) en vez de rechazar es la pista
- * clave: el pedido HTTP real probablemente SÍ salió por la red — es el valor de
- * retorno de su envoltorio el que está roto, no el pedido en sí. En vez de depender
- * del valor que devuelve CUALQUIERA de los dos `fetch` de JS, esto dispara el pedido
- * con el `fetch` normal de la página (ignorando lo que devuelva) y captura la
- * respuesta real por el lado de Puppeteer/CDP (`page.waitForResponse`), que ve el
- * tráfico de red tal cual viajó, sin pasar por el valor de retorno de ningún wrapper
- * de JS ni por el CORS que sólo se aplica a nivel de la Promise de `fetch()`.
+ * CAUSA RAÍZ CONFIRMADA en vivo (ver commits anteriores de esta misma sesión de
+ * depuración): el `fetch()` de la página estaba bloqueado por la propia
+ * Content-Security-Policy de tiktok.com (`connect-src` no incluye
+ * `https://webcast.tiktok.com`) — arreglado con `page.setBypassCSP(true)` en
+ * `initBrowser`. Con eso confirmado (`[SP-FETCH] fetch() resolvió, status= 200`, dos
+ * veces seguidas), se volvió a esta forma simple de leer el cuerpo DENTRO de la
+ * página — el rodeo por `page.waitForResponse`/`response.buffer()` de Puppeteer (CDP)
+ * que se probó mientras se buscaba la causa real terminó siendo, en sí mismo, un
+ * problema nuevo: `response.buffer()` se cuelga de forma conocida cuando se combina
+ * interceptación de peticiones con bypass de CSP. Ya no hace falta ese rodeo.
  */
 async function fetchRawBytesThroughPage(signedUrl) {
-  // Match por pathname, NO por igualdad exacta de string: la primera vuelta de esto
-  // dio timeout con un `res.url() === signedUrl` estricto — Chrome puede re-serializar
-  // la URL real (encoding de espacios/caracteres especiales en el user_agent, orden de
-  // query params) antes de que salga por la red, así que la respuesta real puede
-  // tener una forma ligeramente distinta al string que armamos acá. Sólo puede haber
-  // UN pedido de este tipo en vuelo a la vez (mismo slot de `queueSignatureRequest`
-  // que ya serializa firma+fetch), así que matchear sólo por pathname es seguro.
-  const seenDuringWait = [];
-  const failedDuringWait = [];
-  const onAnyResponse = (res) => {
-    seenDuringWait.push(res.url());
-  };
-  const onAnyRequestFailed = (req) => {
-    // Confirmado por curl desde la propia VM: la red llega bien a webcast.tiktok.com
-    // (200 real). Si acá aparece algo para esa URL, es un bloqueo del LADO DEL
-    // NAVEGADOR (CSP es el candidato principal) — nunca llega a intentar la red.
-    failedDuringWait.push({
-      url: req.url(),
-      resourceType: req.resourceType(),
-      errorText: req.failure()?.errorText,
-    });
-  };
-  page.on("response", onAnyResponse);
-  page.on("requestfailed", onAnyRequestFailed);
-
-  const responsePromise = page.waitForResponse(
-    (res) => res.url().includes("/webcast/im/fetch/"),
-    { timeout: 15000 },
-  );
-
-  await page.evaluate((url) => {
-    // Fire-and-forget a propósito: no confiamos en lo que esta promesa resuelva ni en
-    // si rechaza (ver el comentario de arriba) — sólo nos interesa que el pedido salga
-    // por la red; la respuesta real se captura del lado de Puppeteer.
-    //
-    // DIAGNOSTIC — logueamos si la propia promesa de fetch() alguna vez resuelve o
-    // rechaza, del lado de la página (esto SÍ se reenvía a la terminal ahora, ver el
-    // prefijo [SP-FETCH] en el listener de consola).
-    console.log("[SP-FETCH] disparando fetch a", url.slice(0, 80));
-    fetch(url, {
-      credentials: "include",
-      headers: { Accept: "application/protobuf,application/json" },
-    })
-      .then((r) => console.log("[SP-FETCH] fetch() resolvió, status=", r && r.status))
-      .catch((e) => console.log("[SP-FETCH] fetch() rechazó:", e && e.message));
+  const result = await page.evaluate(async (url) => {
+    try {
+      const response = await fetch(url, {
+        credentials: "include",
+        headers: { Accept: "application/protobuf,application/json" },
+      });
+      const buf = await response.arrayBuffer();
+      let binary = "";
+      const bytes = new Uint8Array(buf);
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      return { status: response.status, bodyBase64: btoa(binary) };
+    } catch (e) {
+      return { error: e.message };
+    }
   }, signedUrl);
 
-  let response;
-  try {
-    // Guardia dura: si `response.buffer()` (o cualquier otra cosa acá) se cuelga sin
-    // avisar, esto libera el slot de la cola en vez de trabarla para siempre — pasó
-    // en la vuelta anterior (después de "continue() sin tirar error" no salió nada
-    // más nunca, ni éxito ni timeout).
-    response = await Promise.race([
-      responsePromise,
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("watchdog: 20s sin resolver")), 20000),
-      ),
-    ]);
-  } catch (e) {
-    page.off("response", onAnyResponse);
-    page.off("requestfailed", onAnyRequestFailed);
-    // DIAGNOSTIC — si esto también da timeout, esta lista dice si hubo CUALQUIER
-    // actividad de red mientras esperábamos (confirma/descarta que el pedido ni
-    // siquiera salió, en vez de sólo el nuestro no matcheando), y la de fallos dice
-    // si el navegador lo bloqueó antes de intentar la red (CSP, etc.).
-    console.log(
-      `[webcast] timeout esperando /webcast/im/fetch/ — respuestas vistas mientras tanto:`,
-      JSON.stringify(seenDuringWait.slice(0, 20)),
-      `— pedidos fallidos:`,
-      JSON.stringify(failedDuringWait.slice(0, 20)),
-    );
-    throw new Error(`no llegó ninguna respuesta de red que matchee: ${e.message}`);
-  }
-  page.off("response", onAnyResponse);
-  page.off("requestfailed", onAnyRequestFailed);
-
-  console.log(`[webcast] responsePromise resolvió — status=${response.status()}, bajando el cuerpo...`);
-  const buf = await Promise.race([
-    response.buffer(),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("watchdog: response.buffer() no terminó en 10s")), 10000),
-    ),
-  ]);
-  return { status: response.status(), bytes: buf };
+  if (result.error) throw new Error(result.error);
+  return { status: result.status, bytes: Buffer.from(result.bodyBase64, "base64") };
 }
 
 /**
