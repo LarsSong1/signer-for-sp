@@ -305,6 +305,18 @@ async function initBrowser() {
       }
     });
 
+    // StreamPack: TikTok's own SDK patches `window.fetch` (it needs to, to build the
+    // totalFetchRequests/interceptedFetchRequests counters `_signDirectly` reads from
+    // `window.__cap3` for its own anti-bot signature) — confirmed live: after that
+    // patch, calling `fetch()` against `webcast.tiktok.com/webcast/im/fetch/` resolves
+    // to `undefined` instead of a real Response (`fetchIsNative: false` in the
+    // diagnostic added alongside this fix). `evaluateOnNewDocument` runs before ANY
+    // page script on every navigation (a CDP guarantee), so this always wins the race
+    // and stashes the true native fetch before TikTok's SDK can touch it.
+    await page.evaluateOnNewDocument(() => {
+      window.__streampackNativeFetch = window.fetch.bind(window);
+    });
+
     // Initialize with local SDK
     await initWithLocalSdk();
     lastInitTime = new Date().toISOString();
@@ -622,7 +634,11 @@ async function fetchRawBytesThroughPage(signedUrl) {
   const result = await page.evaluate(async (url) => {
     let response;
     try {
-      response = await fetch(url, {
+      // Usar el fetch NATIVO capturado antes de que el SDK de TikTok lo parcheara (ver
+      // el evaluateOnNewDocument que guarda window.__streampackNativeFetch) — el fetch
+      // global de la página ya no es de fiar para esta llamada específica.
+      const realFetch = window.__streampackNativeFetch || fetch;
+      response = await realFetch(url, {
         credentials: "include",
         headers: { Accept: "application/protobuf,application/json" },
       });
