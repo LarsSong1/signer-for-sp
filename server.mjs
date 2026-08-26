@@ -404,6 +404,19 @@ async function initWithLocalSdk() {
     const url = request.url();
     const resourceType = request.resourceType();
 
+    // DIAGNOSTIC — la petición a webcast/im/fetch nunca aparece en response ni en
+    // requestfailed del lado de Puppeteer, aunque curl desde la misma VM sí conecta
+    // bien contra ese host. Candidato principal: algo en ESTE handler (o el
+    // `request.continue()` de más abajo, sin try/catch hoy) la deja colgada sin
+    // resolver. Loguear entrada + resultado real de la resolución para esta URL en
+    // particular, sin tocar el comportamiento de ninguna otra.
+    const isWebcastFetch = url.includes("/webcast/im/fetch/");
+    if (isWebcastFetch) {
+      console.log(
+        `[webcast] requestHandler vio la petición — resourceType=${resourceType} isInterceptResolutionHandled=${request.isInterceptResolutionHandled?.()}`,
+      );
+    }
+
     if (url.includes("/webmssdk/")) {
       let body = null;
       if (url.includes("2.0.0.485") && sdk485) body = sdk485;
@@ -435,11 +448,22 @@ async function initWithLocalSdk() {
 
     // Block heavy resources to speed up loading
     if (["image", "media", "font"].includes(resourceType)) {
+      if (isWebcastFetch) {
+        console.log(`[webcast] requestHandler la ABORTÓ por resourceType=${resourceType} (bug: no debería pasar)`);
+      }
       await request.abort();
       return;
     }
 
-    await request.continue();
+    try {
+      await request.continue();
+      if (isWebcastFetch) console.log(`[webcast] requestHandler llamó a continue() sin tirar error`);
+    } catch (e) {
+      // Antes de este cambio esto quedaba sin capturar: si continue() tira acá, la
+      // petición queda colgada para siempre (ni continúa, ni aborta, ni responde) —
+      // exactamente el síntoma que estamos viendo para webcast/im/fetch.
+      console.log(`[Server] request.continue() failed for ${url.slice(0, 100)}: ${e.message}`);
+    }
   };
 
   page.on("request", requestHandler);
