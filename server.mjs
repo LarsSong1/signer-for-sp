@@ -644,8 +644,20 @@ async function fetchRawBytesThroughPage(signedUrl) {
  * through that SAME page. Runs as ONE queue slot (sign + fetch together) so an
  * overlapping request's signing can't interleave with this one's fetch on the shared
  * page.
+ *
+ * @param {string|null} tunnelId - StreamPack: si el gateway mandó
+ *   `x-streampack-tunnel-id` (el streamer activó el túnel propio, ver
+ *   `streampack-tiktok-gateway/src/tunnelBroker.ts`), llega acá. TODAVÍA NO cambia nada
+ *   del comportamiento — sólo se loguea, a propósito: la parte que sí importa (un
+ *   contexto de Puppeteer con su proxy propio en vez de la única página compartida) es
+ *   un cambio real a la vía de firma que ya funciona hoy, y no se toca a ciegas. Este
+ *   parámetro deja el resto de la cañería lista para cuando se implemente eso aparte,
+ *   probado en vivo antes de confiar en él.
  */
-async function fetchWebcastRawBytes(targetUrl, userAgent) {
+async function fetchWebcastRawBytes(targetUrl, userAgent, tunnelId = null) {
+  if (tunnelId) {
+    console.log(`[webcast] túnel propio pedido para esta sala (tunnelId=${tunnelId}) — todavía sin usar, firmando por el proxy compartido de siempre`);
+  }
   return queueSignatureRequest(async () => {
     const signed = await _generateSignedUrlInternal(targetUrl, userAgent, null);
     return fetchRawBytesThroughPage(signed.signedUrl);

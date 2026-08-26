@@ -126,9 +126,14 @@ export function createWebcastRoutes({
       clientEnter: query.get("client_enter") === "true" || query.get("client_enter") === "1",
     });
 
+    // Túnel propio del streamer (opt-in, ver `chat.rs`/`tunnelBroker.ts`) — llega como
+    // header desde el gateway, threadeado por el patch de `tiktok-live-connector`. Hoy
+    // sólo viaja hasta acá y se loguea (ver el comentario de `fetchWebcastRawBytes`).
+    const tunnelId = req.headers["x-streampack-tunnel-id"] || null;
+
     let raw;
     try {
-      raw = await fetchWebcastRawBytes(targetUrl, userAgent || null);
+      raw = await fetchWebcastRawBytes(targetUrl, userAgent || null, tunnelId);
     } catch (e) {
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ message: `webcast fetch failed: ${e.message}` }));
