@@ -247,6 +247,18 @@ async function initBrowser() {
 
     page = await browser.newPage();
 
+    // StreamPack: la petición a webcast/im/fetch nunca llega ni a nuestro propio
+    // interceptor de peticiones (page.on("request")) ni a Puppeteer como response/
+    // requestfailed -- confirmado con logs reales -- aunque curl desde esta misma VM
+    // sí conecta bien contra ese host. El HTML real de tiktok.com carga un Service
+    // Worker (`data-sw="/sw.js"`), que corre en un contexto aparte del de la página e
+    // intercepta fetch() ANTES de que llegue a la capa de red que Puppeteer instrumenta
+    // a nivel de página -- explica por qué no queda ningún rastro en ningún lado. Se
+    // le pide a Chrome que bypassee cualquier Service Worker para esta página, para que
+    // todo fetch() vaya directo a la red real.
+    const cdpSession = await page.target().createCDPSession();
+    await cdpSession.send("Network.setBypassServiceWorker", { bypass: true });
+
     // Registers the in-page WS bridge (see routes/ws-proxy.mjs) — must happen before
     // this page's first navigation so `evaluateOnNewDocument` covers it.
     await wsProxy.installBridge(page);
