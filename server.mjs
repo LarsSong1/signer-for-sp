@@ -247,15 +247,23 @@ async function initBrowser() {
 
     page = await browser.newPage();
 
-    // StreamPack: la petición a webcast/im/fetch nunca llega ni a nuestro propio
-    // interceptor de peticiones (page.on("request")) ni a Puppeteer como response/
-    // requestfailed -- confirmado con logs reales -- aunque curl desde esta misma VM
-    // sí conecta bien contra ese host. El HTML real de tiktok.com carga un Service
-    // Worker (`data-sw="/sw.js"`), que corre en un contexto aparte del de la página e
-    // intercepta fetch() ANTES de que llegue a la capa de red que Puppeteer instrumenta
-    // a nivel de página -- explica por qué no queda ningún rastro en ningún lado. Se
-    // le pide a Chrome que bypassee cualquier Service Worker para esta página, para que
-    // todo fetch() vaya directo a la red real.
+    // StreamPack: CONFIRMADO en vivo (consola real capturada) — la petición a
+    // webcast/im/fetch la bloquea la propia Content-Security-Policy (`connect-src`) de
+    // la página de tiktok.com: "Fetch API cannot load .../webcast/im/fetch/... Refused
+    // to connect because it violates the document's Content Security Policy." Esa CSP
+    // permite `wss://im-ws.tiktok.com` pero no `https://webcast.tiktok.com` para fetch
+    // normal — coincide exacto con por qué nunca aparecía ni en response, ni en
+    // requestfailed, ni en nuestro propio interceptor de peticiones: el bloqueo pasa
+    // ANTES de que la petición llegue a la capa de red. `setBypassCSP` es el mecanismo
+    // oficial de Puppeteer/CDP para que herramientas de automatización ignoren la CSP
+    // de la página — a diferencia de los intentos anteriores (fetch nativo, captura por
+    // CDP, bypass de Service Worker), esto ataca la causa real ya confirmada, no una
+    // teoría.
+    await page.setBypassCSP(true);
+
+    // Se deja también el bypass de Service Worker (barato, sin downside) por si en
+    // algún momento vuelve a haber una capa de bloqueo distinta — pero la CSP de arriba
+    // es la causa real confirmada de este síntoma.
     const cdpSession = await page.target().createCDPSession();
     await cdpSession.send("Network.setBypassServiceWorker", { bypass: true });
 
