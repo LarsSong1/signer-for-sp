@@ -620,69 +620,51 @@ async function generateSignedUrl(
 /**
  * Fetches the RAW bytes of a signed URL through the browser page — the protobuf-safe
  * sibling of the existing `/fetch` route, which JSON-parses the response and would
- * corrupt binary data. Bytes cross the `page.evaluate` boundary as base64, since
- * Puppeteer serializes return values as JSON.
+ * corrupt binary data.
  *
- * This IS a page-JS `fetch()`, not a Node-side one. A whole detour was taken this
- * session (Node's own `fetch` → CDP's `Network.loadNetworkResource`) on the theory
- * that this would hit CORS — confirmed live, directly, that it's the correct approach
- * after all: this exact function, unmodified, against a real live room, returns real
- * TikTok protobuf (200, real bytes). Whatever caused the earlier "Failed to fetch"
- * observation, it wasn't a structural CORS block on this call.
+ * CANDIDATO SIN PROBAR TODAVÍA (ver el historial de diagnóstico justo antes de este
+ * cambio, no commiteado hasta confirmarlo en vivo): confirmado con evidencia real que
+ * NINGUNA de las dos formas de fetch de la página sirve hoy para esta llamada en
+ * particular —
+ *   1. El `fetch` de la página, ya parchado por el propio SDK anti-bot de TikTok (lo
+ *      necesita para sus contadores totalFetchRequests/interceptedFetchRequests),
+ *      resuelve en `undefined` en vez de devolver el `Response` real.
+ *   2. El fetch NATIVO real, capturado antes de que ese parche pudiera aplicarse
+ *      (`window.__streampackNativeFetch`), rechaza con "Failed to fetch" — un fallo de
+ *      CORS/red a nivel de JS.
+ * Que el (1) resuelva ALGO (aunque sea `undefined`) en vez de rechazar es la pista
+ * clave: el pedido HTTP real probablemente SÍ salió por la red — es el valor de
+ * retorno de su envoltorio el que está roto, no el pedido en sí. En vez de depender
+ * del valor que devuelve CUALQUIERA de los dos `fetch` de JS, esto dispara el pedido
+ * con el `fetch` normal de la página (ignorando lo que devuelva) y captura la
+ * respuesta real por el lado de Puppeteer/CDP (`page.waitForResponse`), que ve el
+ * tráfico de red tal cual viajó, sin pasar por el valor de retorno de ningún wrapper
+ * de JS ni por el CORS que sólo se aplica a nivel de la Promise de `fetch()`.
  */
 async function fetchRawBytesThroughPage(signedUrl) {
-  const result = await page.evaluate(async (url) => {
-    let response;
-    try {
-      // Usar el fetch NATIVO capturado antes de que el SDK de TikTok lo parcheara (ver
-      // el evaluateOnNewDocument que guarda window.__streampackNativeFetch) — el fetch
-      // global de la página ya no es de fiar para esta llamada específica.
-      const realFetch = window.__streampackNativeFetch || fetch;
-      response = await realFetch(url, {
-        credentials: "include",
-        headers: { Accept: "application/protobuf,application/json" },
-      });
-    } catch (e) {
-      // DIAGNOSTIC — `fetch()` itself rejected. Per spec this is the only way to end up
-      // without a real Response; capture what native fetch actually is right now (TikTok's
-      // anti-bot script is a known candidate for monkey-patching it) so a real cause shows
-      // up in the logs instead of a bare "Failed to fetch".
-      return {
-        error: e.message,
-        stage: "fetch-rejected",
-        fetchIsNative: typeof window.fetch === "function" && window.fetch.toString().includes("[native code]"),
-        pageTitle: document.title,
-        pageUrl: location.href,
-      };
-    }
-    if (!response || typeof response.arrayBuffer !== "function") {
-      // DIAGNOSTIC — `fetch()` resolved but not to a usable Response. Should be
-      // impossible per spec unless something replaced `window.fetch`; capture the same
-      // signals as above instead of guessing.
-      return {
-        error: `fetch() resolved to a non-Response value: ${typeof response}`,
-        stage: "bad-response",
-        fetchIsNative: typeof window.fetch === "function" && window.fetch.toString().includes("[native code]"),
-        pageTitle: document.title,
-        pageUrl: location.href,
-      };
-    }
-    try {
-      const buf = await response.arrayBuffer();
-      let binary = "";
-      const bytes = new Uint8Array(buf);
-      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-      return { status: response.status, bodyBase64: btoa(binary) };
-    } catch (e) {
-      return { error: e.message, stage: "arraybuffer-failed", responseStatus: response.status };
-    }
+  const responsePromise = page.waitForResponse((res) => res.url() === signedUrl, {
+    timeout: 15000,
+  });
+
+  await page.evaluate((url) => {
+    // Fire-and-forget a propósito: no confiamos en lo que esta promesa resuelva ni en
+    // si rechaza (ver el comentario de arriba) — sólo nos interesa que el pedido salga
+    // por la red; la respuesta real se captura del lado de Puppeteer.
+    fetch(url, {
+      credentials: "include",
+      headers: { Accept: "application/protobuf,application/json" },
+    }).catch(() => {});
   }, signedUrl);
 
-  if (result.error) {
-    console.log(`[webcast] fetchRawBytesThroughPage diagnostic:`, JSON.stringify(result));
-    throw new Error(result.error);
+  let response;
+  try {
+    response = await responsePromise;
+  } catch (e) {
+    throw new Error(`no llegó ninguna respuesta de red para ${signedUrl} dentro de 15s: ${e.message}`);
   }
-  return { status: result.status, bytes: Buffer.from(result.bodyBase64, "base64") };
+
+  const buf = await response.buffer();
+  return { status: response.status(), bytes: buf };
 }
 
 /**
