@@ -642,9 +642,23 @@ async function generateSignedUrl(
  * de JS ni por el CORS que sólo se aplica a nivel de la Promise de `fetch()`.
  */
 async function fetchRawBytesThroughPage(signedUrl) {
-  const responsePromise = page.waitForResponse((res) => res.url() === signedUrl, {
-    timeout: 15000,
-  });
+  // Match por pathname, NO por igualdad exacta de string: la primera vuelta de esto
+  // dio timeout con un `res.url() === signedUrl` estricto — Chrome puede re-serializar
+  // la URL real (encoding de espacios/caracteres especiales en el user_agent, orden de
+  // query params) antes de que salga por la red, así que la respuesta real puede
+  // tener una forma ligeramente distinta al string que armamos acá. Sólo puede haber
+  // UN pedido de este tipo en vuelo a la vez (mismo slot de `queueSignatureRequest`
+  // que ya serializa firma+fetch), así que matchear sólo por pathname es seguro.
+  const seenDuringWait = [];
+  const onAnyResponse = (res) => {
+    seenDuringWait.push(res.url());
+  };
+  page.on("response", onAnyResponse);
+
+  const responsePromise = page.waitForResponse(
+    (res) => res.url().includes("/webcast/im/fetch/"),
+    { timeout: 15000 },
+  );
 
   await page.evaluate((url) => {
     // Fire-and-forget a propósito: no confiamos en lo que esta promesa resuelva ni en
@@ -660,8 +674,17 @@ async function fetchRawBytesThroughPage(signedUrl) {
   try {
     response = await responsePromise;
   } catch (e) {
-    throw new Error(`no llegó ninguna respuesta de red para ${signedUrl} dentro de 15s: ${e.message}`);
+    page.off("response", onAnyResponse);
+    // DIAGNOSTIC — si esto también da timeout, esta lista dice si hubo CUALQUIER
+    // actividad de red mientras esperábamos (confirma/descarta que el pedido ni
+    // siquiera salió, en vez de sólo el nuestro no matcheando).
+    console.log(
+      `[webcast] timeout esperando /webcast/im/fetch/ — respuestas vistas mientras tanto:`,
+      JSON.stringify(seenDuringWait.slice(0, 20)),
+    );
+    throw new Error(`no llegó ninguna respuesta de red que matchee dentro de 15s: ${e.message}`);
   }
+  page.off("response", onAnyResponse);
 
   const buf = await response.buffer();
   return { status: response.status(), bytes: buf };
