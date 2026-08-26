@@ -282,7 +282,12 @@ async function initBrowser() {
       }
       const type = msg.type();
       if (type === "error" || type === "warning") {
-        console.log(`[webcast] console.${type}:`, text.slice(0, 500));
+        // Acortar cualquier URL larga DENTRO del mensaje (nuestras URLs firmadas son
+        // enormes por X-Bogus/X-Gnarly/msToken) en vez de cortar el mensaje entero por
+        // longitud — el motivo real de Chrome suele venir DESPUÉS de la URL, y un
+        // slice(0, N) simple se lo comía antes de que llegáramos a verlo.
+        const shortened = text.replace(/https?:\/\/\S{80,}/g, (m) => m.slice(0, 60) + "…[url acortada]");
+        console.log(`[webcast] console.${type}:`, shortened.slice(0, 1500));
       }
     });
     page.on("pageerror", (err) => {
