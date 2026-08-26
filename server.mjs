@@ -620,22 +620,52 @@ async function generateSignedUrl(
  */
 async function fetchRawBytesThroughPage(signedUrl) {
   const result = await page.evaluate(async (url) => {
+    let response;
     try {
-      const response = await fetch(url, {
+      response = await fetch(url, {
         credentials: "include",
         headers: { Accept: "application/protobuf,application/json" },
       });
+    } catch (e) {
+      // DIAGNOSTIC — `fetch()` itself rejected. Per spec this is the only way to end up
+      // without a real Response; capture what native fetch actually is right now (TikTok's
+      // anti-bot script is a known candidate for monkey-patching it) so a real cause shows
+      // up in the logs instead of a bare "Failed to fetch".
+      return {
+        error: e.message,
+        stage: "fetch-rejected",
+        fetchIsNative: typeof window.fetch === "function" && window.fetch.toString().includes("[native code]"),
+        pageTitle: document.title,
+        pageUrl: location.href,
+      };
+    }
+    if (!response || typeof response.arrayBuffer !== "function") {
+      // DIAGNOSTIC — `fetch()` resolved but not to a usable Response. Should be
+      // impossible per spec unless something replaced `window.fetch`; capture the same
+      // signals as above instead of guessing.
+      return {
+        error: `fetch() resolved to a non-Response value: ${typeof response}`,
+        stage: "bad-response",
+        fetchIsNative: typeof window.fetch === "function" && window.fetch.toString().includes("[native code]"),
+        pageTitle: document.title,
+        pageUrl: location.href,
+      };
+    }
+    try {
       const buf = await response.arrayBuffer();
       let binary = "";
       const bytes = new Uint8Array(buf);
       for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
       return { status: response.status, bodyBase64: btoa(binary) };
     } catch (e) {
-      return { error: e.message };
+      return { error: e.message, stage: "arraybuffer-failed", responseStatus: response.status };
     }
   }, signedUrl);
 
-  if (result.error) throw new Error(result.error);
+  if (result.error) {
+    console.log(`[webcast] fetchRawBytesThroughPage diagnostic:`, JSON.stringify(result));
+    throw new Error(result.error);
+  }
   return { status: result.status, bytes: Buffer.from(result.bodyBase64, "base64") };
 }
 
