@@ -17,6 +17,9 @@
  * - PROXY_HOST    - Proxy host:port (e.g., "proxy.example.com:8080")
  * - PROXY_USER    - Proxy username
  * - PROXY_PASS    - Proxy password
+ * - TUNNEL_INTERNAL_SECRET   - Opt-in per-streamer tunnel, shared with the gateway (see
+ *                              tunnelBroker.ts). Empty = fully inert.
+ * - GATEWAY_TUNNEL_PROXY_URL - The gateway's internal CONNECT proxy URL for the tunnel.
  */
 
 import http from "http";
@@ -51,6 +54,16 @@ const PROXY_ENABLED =
 const PROXY_HOST = process.env.PROXY_HOST || "";
 const PROXY_USER = process.env.PROXY_USER || "";
 const PROXY_PASS = process.env.PROXY_PASS || "";
+
+// Túnel opcional por streamer (ver streampack-tiktok-gateway/src/tunnelBroker.ts) —
+// mismo secreto compartido SOLO entre este proceso y el gateway. Vacío = la función
+// queda inerte del todo: fetchWebcastRawBytes ignora cualquier tunnelId que le llegue y
+// sigue firmando siempre por el proxy compartido de siempre, sin excepción.
+const TUNNEL_INTERNAL_SECRET = process.env.TUNNEL_INTERNAL_SECRET || "";
+// URL del proxy CONNECT interno del gateway (ej. "http://localhost:8082") — nunca
+// expuesto a internet, sólo alcanzable desde este proceso.
+const GATEWAY_TUNNEL_PROXY_URL = process.env.GATEWAY_TUNNEL_PROXY_URL || "";
+const TUNNEL_FEATURE_ENABLED = !!(TUNNEL_INTERNAL_SECRET && GATEWAY_TUNNEL_PROXY_URL);
 
 // Local SDK path - the SDK is used to generate valid signatures
 const SDK_PATH = path.join(__dirname, "javascript", "webmssdk_5.1.3.js");
@@ -379,9 +392,9 @@ async function initBrowser() {
  * button. Returns true if the error was detected and handled, false otherwise.
  * Tries up to 2 retries since the second load occasionally errors too.
  */
-async function dismissTikTokErrorIfPresent(maxAttempts = 2) {
+async function dismissTikTokErrorIfPresent(maxAttempts = 2, targetPage = page) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const state = await page.evaluate(() => {
+    const state = await targetPage.evaluate(() => {
       const text = document.body ? document.body.innerText || "" : "";
       const hasError = /Something went wrong/i.test(text);
       const refreshBtn = Array.from(document.querySelectorAll("button")).find(
@@ -395,7 +408,7 @@ async function dismissTikTokErrorIfPresent(maxAttempts = 2) {
     console.log(
       `[Server] Detected "Something went wrong" interstitial (attempt ${attempt}/${maxAttempts}), clicking Refresh...`,
     );
-    await page.evaluate(() => {
+    await targetPage.evaluate(() => {
       const btn = Array.from(document.querySelectorAll("button")).find((b) =>
         /^\s*Refresh\s*$/i.test(b.textContent || ""),
       );
@@ -403,7 +416,7 @@ async function dismissTikTokErrorIfPresent(maxAttempts = 2) {
     });
     // Wait for the bundle to re-initialise after the click
     try {
-      await page.waitForNavigation({
+      await targetPage.waitForNavigation({
         waitUntil: "domcontentloaded",
         timeout: 30000,
       });
@@ -602,6 +615,10 @@ async function closeBrowser() {
     page = null;
   }
 
+  // browser.close() ya se llevó puesto cualquier BrowserContext de túnel que hubiera —
+  // limpiar el mapa para no intentar reusar páginas muertas la próxima vez.
+  tunnelContexts.clear();
+
   // Clean up user data directory to prevent disk space accumulation
   try {
     if (fs.existsSync(USER_DATA_DIR)) {
@@ -613,6 +630,123 @@ async function closeBrowser() {
   }
 
   console.log("[Server] Browser closed, all state reset");
+}
+
+/**
+ * Túnel opcional por streamer (ver streampack-tiktok-gateway/src/tunnelBroker.ts) —
+ * cada streamer con el túnel activo tiene su PROPIO BrowserContext, lanzado con el
+ * proxy CONNECT interno del gateway como su `proxyServer`, así que cualquier fetch
+ * hecho desde una página de ese contexto sale por la conexión de ESE streamer en vez
+ * de la del signer. La FIRMA (`_signDirectly`) sigue haciéndose siempre en la página
+ * global de siempre — no toca este archivo — porque el perfil en disco
+ * (`userDataDir`) se comparte entre todos los contextos del mismo `browser.launch()`,
+ * así que las cookies/msToken de la sesión firmante ya están disponibles acá también
+ * sin duplicar nada: sólo cambia por dónde sale la conexión del FETCH final.
+ *
+ * `tunnelId -> { context, page, lastUsed }`. Vive mientras dure la conexión de chat de
+ * ese streamer en Studio (un `tunnelId` nuevo por cada sesión — ver `wsServer.ts`); el
+ * barrido de `pruneIdleTunnelContexts` se encarga de los que quedan huérfanos si el
+ * streamer se desconecta sin que este proceso se entere directamente.
+ */
+const tunnelContexts = new Map();
+const TUNNEL_CONTEXT_IDLE_MS = 15 * 60 * 1000;
+
+/** Bloquea request/response pesados (imágenes, media, fuentes, SDKs de telemetría) en
+ *  una página de túnel — no firma nada acá, así que no hace falta servir el SDK local
+ *  ni interceptar webmssdk como sí hace la página principal; esto es sólo para no
+ *  gastar de más el ancho de banda del propio streamer. */
+function installLightRequestBlocking(targetPage) {
+  return targetPage.setRequestInterception(true).then(() => {
+    targetPage.on("request", async (request) => {
+      const url = request.url();
+      const resourceType = request.resourceType();
+      if (
+        url.includes("slardar") ||
+        url.includes("acrawler") ||
+        ["image", "media", "font"].includes(resourceType)
+      ) {
+        try {
+          await request.abort();
+        } catch (e) {}
+        return;
+      }
+      try {
+        await request.continue();
+      } catch (e) {}
+    });
+  });
+}
+
+/** Crea (o reusa) el contexto de túnel de un streamer. Tira si algo falla en el
+ *  camino — el llamador (`fetchWebcastRawBytes`) cae al proxy compartido de siempre
+ *  ante cualquier error acá, el túnel es la excepción, no lo único que existe. */
+async function getOrCreateTunnelPage(tunnelId) {
+  const existing = tunnelContexts.get(tunnelId);
+  if (existing) {
+    existing.lastUsed = Date.now();
+    return existing.page;
+  }
+
+  console.log(`[tunnel] creando contexto propio para tunnelId=${tunnelId}`);
+  const context = await browser.createBrowserContext({
+    proxyServer: GATEWAY_TUNNEL_PROXY_URL,
+  });
+  let tunnelPage;
+  try {
+    tunnelPage = await context.newPage();
+    // El proxy CONNECT del gateway pide Basic auth: usuario = tunnelId (así identifica
+    // de cuál streamer es este pedido), contraseña = el secreto compartido — ver
+    // `tunnelBroker.ts::parseBasicAuth`.
+    await tunnelPage.authenticate({ username: tunnelId, password: TUNNEL_INTERNAL_SECRET });
+    // Mismo motivo que en la página principal — ver el comentario largo en initBrowser.
+    await tunnelPage.setBypassCSP(true);
+    await tunnelPage.setUserAgent(DEFAULT_UA);
+    await tunnelPage.setViewport({ width: 1920, height: 1080 });
+    await installLightRequestBlocking(tunnelPage);
+
+    // Navegar a un origen real de tiktok.com es necesario para que las cookies de la
+    // sesión firmante (SameSite=Lax/Strict, no None) viajen en el fetch de más abajo —
+    // un fetch cross-site desde una página que nunca pisó tiktok.com no las mandaría.
+    await tunnelPage.goto("https://www.tiktok.com/@zara", {
+      waitUntil: "domcontentloaded",
+      timeout: 60000,
+    });
+    await dismissTikTokErrorIfPresent(2, tunnelPage);
+  } catch (e) {
+    try {
+      await context.close();
+    } catch (closeErr) {}
+    throw e;
+  }
+
+  tunnelContexts.set(tunnelId, { context, page: tunnelPage, lastUsed: Date.now() });
+  console.log(`[tunnel] contexto listo para tunnelId=${tunnelId}`);
+  return tunnelPage;
+}
+
+/** Barrido periódico — cierra contextos de túnel que ningún pedido usó en un buen
+ *  rato (el streamer se desconectó de Studio sin que este proceso se entere
+ *  directamente de otra forma). Sin esto, cada sesión nueva de Studio (un `tunnelId`
+ *  distinto cada vez) dejaría un contexto huérfano acumulándose para siempre. */
+async function pruneIdleTunnelContexts() {
+  const now = Date.now();
+  for (const [tunnelId, t] of tunnelContexts) {
+    if (now - t.lastUsed > TUNNEL_CONTEXT_IDLE_MS) {
+      console.log(`[tunnel] cerrando contexto inactivo para tunnelId=${tunnelId}`);
+      tunnelContexts.delete(tunnelId);
+      try {
+        await t.context.close();
+      } catch (e) {
+        console.error(`[tunnel] error cerrando contexto de ${tunnelId}:`, e.message);
+      }
+    }
+  }
+}
+
+if (TUNNEL_FEATURE_ENABLED) {
+  setInterval(() => {
+    pruneIdleTunnelContexts().catch((e) => console.error("[tunnel] prune error:", e.message));
+  }, 5 * 60 * 1000);
 }
 
 /**
@@ -701,8 +835,8 @@ async function generateSignedUrl(
  * problema nuevo: `response.buffer()` se cuelga de forma conocida cuando se combina
  * interceptación de peticiones con bypass de CSP. Ya no hace falta ese rodeo.
  */
-async function fetchRawBytesThroughPage(signedUrl) {
-  const result = await page.evaluate(async (url) => {
+async function fetchRawBytesThroughPage(signedUrl, targetPage = page) {
+  const result = await targetPage.evaluate(async (url) => {
     try {
       const response = await fetch(url, {
         credentials: "include",
@@ -723,26 +857,36 @@ async function fetchRawBytesThroughPage(signedUrl) {
 }
 
 /**
- * Signs `targetUrl` (browser+SDK, needs the shared page) then fetches the signed URL
- * through that SAME page. Runs as ONE queue slot (sign + fetch together) so an
- * overlapping request's signing can't interleave with this one's fetch on the shared
- * page.
+ * Signs `targetUrl` (browser+SDK, needs the shared page) then fetches the signed URL —
+ * por el contexto de túnel propio del streamer si lo pidió y está disponible
+ * (`tunnelId`), si no por la página compartida de siempre. Runs as ONE queue slot
+ * (sign + fetch together) so an overlapping request's signing can't interleave with
+ * this one's fetch.
  *
- * @param {string|null} tunnelId - StreamPack: si el gateway mandó
- *   `x-streampack-tunnel-id` (el streamer activó el túnel propio, ver
- *   `streampack-tiktok-gateway/src/tunnelBroker.ts`), llega acá. TODAVÍA NO cambia nada
- *   del comportamiento — sólo se loguea, a propósito: la parte que sí importa (un
- *   contexto de Puppeteer con su proxy propio en vez de la única página compartida) es
- *   un cambio real a la vía de firma que ya funciona hoy, y no se toca a ciegas. Este
- *   parámetro deja el resto de la cañería lista para cuando se implemente eso aparte,
- *   probado en vivo antes de confiar en él.
+ * @param {string|null} tunnelId - Si el gateway mandó `x-streampack-tunnel-id` (el
+ *   streamer activó el túnel propio, ver `streampack-tiktok-gateway/src/tunnelBroker.ts`)
+ *   Y este proceso tiene `TUNNEL_INTERNAL_SECRET`/`GATEWAY_TUNNEL_PROXY_URL`
+ *   configurados, el fetch (NO la firma — esa siempre corre en la página compartida,
+ *   ver `getOrCreateTunnelPage`) sale por la conexión propia de ese streamer. Ante
+ *   cualquier fallo armando/usando ese contexto, cae al proxy compartido de siempre en
+ *   vez de romper el pedido — el túnel es la excepción, no lo único que existe.
  */
 async function fetchWebcastRawBytes(targetUrl, userAgent, tunnelId = null) {
-  if (tunnelId) {
-    console.log(`[webcast] túnel propio pedido para esta sala (tunnelId=${tunnelId}) — todavía sin usar, firmando por el proxy compartido de siempre`);
-  }
   return queueSignatureRequest(async () => {
     const signed = await _generateSignedUrlInternal(targetUrl, userAgent, null);
+
+    if (tunnelId && TUNNEL_FEATURE_ENABLED) {
+      try {
+        const tunnelPage = await getOrCreateTunnelPage(tunnelId);
+        return await fetchRawBytesThroughPage(signed.signedUrl, tunnelPage);
+      } catch (e) {
+        console.log(
+          `[tunnel] falló para tunnelId=${tunnelId} (${e.message}) — cayendo al proxy compartido`,
+        );
+        tunnelContexts.delete(tunnelId);
+      }
+    }
+
     return fetchRawBytesThroughPage(signed.signedUrl);
   });
 }
