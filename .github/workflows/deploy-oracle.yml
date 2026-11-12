@@ -15,7 +15,10 @@ on:
 
 jobs:
   deploy:
-    runs-on: self-hosted
+    # Sólo el runner de producción (VM streampack-vnic-gateway, ~/runner-signer): sin la
+    # etiqueta, cualquier runner self-hosted del repo podía recogerlo (pasó con
+    # `stream-services` en septiembre).
+    runs-on: [self-hosted, produccion]
     steps:
       - name: git reset --hard al último main y reconstruir
         run: |
