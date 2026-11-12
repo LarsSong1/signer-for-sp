@@ -9,7 +9,7 @@
  * - POST /signature - Generate signed URL (body: { "url": "..." }) - RECOMMENDED for scalability
  * - POST /fetch     - Fetch through browser (slower, but 100% reliable fallback)
  * - GET  /health    - Health check
- * - GET  /restart   - Restart browser session
+ * - POST /restart   - Restart browser session (header x-signer-secret)
  *
  * Environment Variables:
  * - PORT          - Server port (default: 8080)
@@ -20,9 +20,14 @@
  * - TUNNEL_INTERNAL_SECRET   - Opt-in per-streamer tunnel, shared with the gateway (see
  *                              tunnelBroker.ts). Empty = fully inert.
  * - GATEWAY_TUNNEL_PROXY_URL - The gateway's internal CONNECT proxy URL for the tunnel.
+ * - RELAY_POOL               - "0" keeps live-room sockets in the signing page (old way).
+ * - RELAY_ROOMS_PER_PAGE     - Live rooms per relay page (default 40).
+ * - RELAY_URL                - Light tiktok.com document the relays load (default robots.txt).
+ * - SIGNER_INTERNAL_SECRET   - Required for POST /restart. Empty = /restart disabled.
  */
 
 import http from "http";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -31,6 +36,7 @@ import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { encode as encodeXGnarly } from "./xgnarly.mjs";
 import { createWebcastRoutes } from "./routes/webcast-connect.mjs";
 import { createWsProxyRoutes } from "./routes/ws-proxy.mjs";
+import { createRelayPool } from "./routes/relay-pool.mjs";
 
 // Use stealth plugin with default evasions
 puppeteer.use(StealthPlugin());
@@ -64,6 +70,13 @@ const TUNNEL_INTERNAL_SECRET = process.env.TUNNEL_INTERNAL_SECRET || "";
 // expuesto a internet, sólo alcanzable desde este proceso.
 const GATEWAY_TUNNEL_PROXY_URL = process.env.GATEWAY_TUNNEL_PROXY_URL || "";
 const TUNNEL_FEATURE_ENABLED = !!(TUNNEL_INTERNAL_SECRET && GATEWAY_TUNNEL_PROXY_URL);
+
+// Live-room WebSockets in separate relay pages (routes/relay-pool.mjs). "0" = the old
+// behaviour (everything in the signing page), kept as an emergency switch.
+const RELAY_POOL_ENABLED = process.env.RELAY_POOL !== "0";
+
+// Protects /restart (it drops every live room). Empty = /restart is disabled.
+const SIGNER_INTERNAL_SECRET = process.env.SIGNER_INTERNAL_SECRET || "";
 
 // Local SDK path - the SDK is used to generate valid signatures
 const SDK_PATH = path.join(__dirname, "javascript", "webmssdk_5.1.3.js");
@@ -259,122 +272,7 @@ async function initBrowser() {
     });
 
     page = await browser.newPage();
-
-    // StreamPack: CONFIRMADO en vivo (consola real capturada) — la petición a
-    // webcast/im/fetch la bloquea la propia Content-Security-Policy (`connect-src`) de
-    // la página de tiktok.com: "Fetch API cannot load .../webcast/im/fetch/... Refused
-    // to connect because it violates the document's Content Security Policy." Esa CSP
-    // permite `wss://im-ws.tiktok.com` pero no `https://webcast.tiktok.com` para fetch
-    // normal — coincide exacto con por qué nunca aparecía ni en response, ni en
-    // requestfailed, ni en nuestro propio interceptor de peticiones: el bloqueo pasa
-    // ANTES de que la petición llegue a la capa de red. `setBypassCSP` es el mecanismo
-    // oficial de Puppeteer/CDP para que herramientas de automatización ignoren la CSP
-    // de la página — a diferencia de los intentos anteriores (fetch nativo, captura por
-    // CDP, bypass de Service Worker), esto ataca la causa real ya confirmada, no una
-    // teoría.
-    await page.setBypassCSP(true);
-
-    // Se deja también el bypass de Service Worker (barato, sin downside) por si en
-    // algún momento vuelve a haber una capa de bloqueo distinta — pero la CSP de arriba
-    // es la causa real confirmada de este síntoma.
-    const cdpSession = await page.target().createCDPSession();
-    await cdpSession.send("Network.setBypassServiceWorker", { bypass: true });
-
-    // Registers the in-page WS bridge (see routes/ws-proxy.mjs) — must happen before
-    // this page's first navigation so `evaluateOnNewDocument` covers it.
-    await wsProxy.installBridge(page);
-
-    // Forwards the bridge's own [SP-WS] diagnostic console.log calls (see
-    // routes/ws-proxy.mjs) to this terminal — otherwise they're only visible in the
-    // headless browser's own console, which nothing reads.
-    //
-    // DIAGNOSTIC — este filtro descartaba TODO lo demás en silencio, incluido
-    // cualquier error real que Chrome loguee a consola (un bloqueo de CSP se reporta
-    // EXACTAMENTE así: "Refused to connect to '...' because it violates the following
-    // Content Security Policy directive..."). Dado que la petición a webcast/im/fetch
-    // no deja rastro en ningún otro lado (ni response, ni requestfailed, ni nuestro
-    // propio interceptor), esto puede ser la señal real que nos faltaba ver. Se
-    // reenvía también cualquier mensaje de tipo error/warning, no sólo los [SP-WS].
-    page.on("console", (msg) => {
-      const text = msg.text();
-      if (text.startsWith("[SP-WS]") || text.startsWith("[SP-FETCH]")) {
-        console.log("[Server]", text);
-        return;
-      }
-      const type = msg.type();
-      if (type === "error" || type === "warning") {
-        // Acortar cualquier URL larga DENTRO del mensaje (nuestras URLs firmadas son
-        // enormes por X-Bogus/X-Gnarly/msToken) en vez de cortar el mensaje entero por
-        // longitud — el motivo real de Chrome suele venir DESPUÉS de la URL, y un
-        // slice(0, N) simple se lo comía antes de que llegáramos a verlo.
-        const shortened = text.replace(/https?:\/\/\S{80,}/g, (m) => m.slice(0, 60) + "…[url acortada]");
-        console.log(`[webcast] console.${type}:`, shortened.slice(0, 1500));
-      }
-    });
-    page.on("pageerror", (err) => {
-      console.log(`[webcast] pageerror:`, String(err).slice(0, 500));
-    });
-
-    // Permanent passive listener: every signed request the page emits gets
-    // cached by its pathname. /signature reads this cache and returns the
-    // freshest URL without navigating.
-    page.on("request", (request) => {
-      try {
-        const u = request.url();
-        if (!u.includes("X-Gnarly=")) return;
-        const parsed = new URL(u);
-        signedUrlCache.set(parsed.pathname, {
-          url: u,
-          capturedAt: Date.now(),
-          referer: request.headers().referer || "",
-        });
-      } catch (e) {}
-    });
-
-    // Authenticate with proxy if enabled
-    if (PROXY_ENABLED && PROXY_USER && PROXY_PASS) {
-      await page.authenticate({
-        username: PROXY_USER,
-        password: PROXY_PASS,
-      });
-    }
-
-    await page.setUserAgent(DEFAULT_UA);
-    await page.setViewport({ width: 1920, height: 1080 });
-
-    // Apply platform override to match Safari on macOS
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, "platform", {
-        get: () => "MacIntel",
-        configurable: true,
-      });
-    });
-
-    await page.evaluateOnNewDocument(() => {
-      if (typeof window.process === "undefined") {
-        window.process = {
-          env: { NODE_ENV: "production" },
-          browser: true,
-          version: "",
-          versions: {},
-        };
-      }
-    });
-
-    // StreamPack: TikTok's own SDK patches `window.fetch` (it needs to, to build the
-    // totalFetchRequests/interceptedFetchRequests counters `_signDirectly` reads from
-    // `window.__cap3` for its own anti-bot signature) — confirmed live: after that
-    // patch, calling `fetch()` against `webcast.tiktok.com/webcast/im/fetch/` resolves
-    // to `undefined` instead of a real Response (`fetchIsNative: false` in the
-    // diagnostic added alongside this fix). `evaluateOnNewDocument` runs before ANY
-    // page script on every navigation (a CDP guarantee), so this always wins the race
-    // and stashes the true native fetch before TikTok's SDK can touch it.
-    await page.evaluateOnNewDocument(() => {
-      window.__streampackNativeFetch = window.fetch.bind(window);
-    });
-
-    // Initialize with local SDK
-    await initWithLocalSdk();
+    await setupSigningPage(page);
     lastInitTime = new Date().toISOString();
     console.log(`[Server] Browser ready (init method: ${initMethod})`);
     isReady = true;
@@ -385,6 +283,130 @@ async function initBrowser() {
   } finally {
     isInitializing = false;
   }
+}
+
+/**
+ * Prepares a fresh signing page: CSP/SW bypass, the WS bridge, the X-Gnarly listener,
+ * UA/platform overrides and the local SDK. Used at browser start and when only the
+ * signing page is recycled (see `recycleSigningPage`).
+ */
+async function setupSigningPage(p) {
+
+  // StreamPack: CONFIRMADO en vivo (consola real capturada) — la petición a
+  // webcast/im/fetch la bloquea la propia Content-Security-Policy (`connect-src`) de
+  // la página de tiktok.com: "Fetch API cannot load .../webcast/im/fetch/... Refused
+  // to connect because it violates the document's Content Security Policy." Esa CSP
+  // permite `wss://im-ws.tiktok.com` pero no `https://webcast.tiktok.com` para fetch
+  // normal — coincide exacto con por qué nunca aparecía ni en response, ni en
+  // requestfailed, ni en nuestro propio interceptor de peticiones: el bloqueo pasa
+  // ANTES de que la petición llegue a la capa de red. `setBypassCSP` es el mecanismo
+  // oficial de Puppeteer/CDP para que herramientas de automatización ignoren la CSP
+  // de la página — a diferencia de los intentos anteriores (fetch nativo, captura por
+  // CDP, bypass de Service Worker), esto ataca la causa real ya confirmada, no una
+  // teoría.
+  await p.setBypassCSP(true);
+
+  // Se deja también el bypass de Service Worker (barato, sin downside) por si en
+  // algún momento vuelve a haber una capa de bloqueo distinta — pero la CSP de arriba
+  // es la causa real confirmada de este síntoma.
+  const cdpSession = await p.target().createCDPSession();
+  await cdpSession.send("Network.setBypassServiceWorker", { bypass: true });
+
+  // Registers the in-page WS bridge (see routes/ws-proxy.mjs) — must happen before
+  // this page's first navigation so `evaluateOnNewDocument` covers it.
+  await wsProxy.installBridge(p);
+
+  // Forwards the bridge's own [SP-WS] diagnostic console.log calls (see
+  // routes/ws-proxy.mjs) to this terminal — otherwise they're only visible in the
+  // headless browser's own console, which nothing reads.
+  //
+  // DIAGNOSTIC — este filtro descartaba TODO lo demás en silencio, incluido
+  // cualquier error real que Chrome loguee a consola (un bloqueo de CSP se reporta
+  // EXACTAMENTE así: "Refused to connect to '...' because it violates the following
+  // Content Security Policy directive..."). Dado que la petición a webcast/im/fetch
+  // no deja rastro en ningún otro lado (ni response, ni requestfailed, ni nuestro
+  // propio interceptor), esto puede ser la señal real que nos faltaba ver. Se
+  // reenvía también cualquier mensaje de tipo error/warning, no sólo los [SP-WS].
+  p.on("console", (msg) => {
+  const text = msg.text();
+    if (text.startsWith("[SP-WS]") || text.startsWith("[SP-FETCH]")) {
+      console.log("[Server]", text);
+      return;
+    }
+    const type = msg.type();
+    if (type === "error" || type === "warning") {
+      // Acortar cualquier URL larga DENTRO del mensaje (nuestras URLs firmadas son
+      // enormes por X-Bogus/X-Gnarly/msToken) en vez de cortar el mensaje entero por
+      // longitud — el motivo real de Chrome suele venir DESPUÉS de la URL, y un
+      // slice(0, N) simple se lo comía antes de que llegáramos a verlo.
+      const shortened = text.replace(/https?:\/\/\S{80,}/g, (m) => m.slice(0, 60) + "…[url acortada]");
+      console.log(`[webcast] console.${type}:`, shortened.slice(0, 1500));
+    }
+  });
+  p.on("pageerror", (err) => {
+    console.log(`[webcast] pageerror:`, String(err).slice(0, 500));
+  });
+
+  // Permanent passive listener: every signed request the page emits gets
+  // cached by its pathname. /signature reads this cache and returns the
+  // freshest URL without navigating.
+  p.on("request", (request) => {
+    try {
+      const u = request.url();
+      if (!u.includes("X-Gnarly=")) return;
+      const parsed = new URL(u);
+      signedUrlCache.set(parsed.pathname, {
+        url: u,
+        capturedAt: Date.now(),
+        referer: request.headers().referer || "",
+      });
+    } catch (e) {}
+  });
+
+  // Authenticate with proxy if enabled
+  if (PROXY_ENABLED && PROXY_USER && PROXY_PASS) {
+    await p.authenticate({
+      username: PROXY_USER,
+      password: PROXY_PASS,
+    });
+  }
+
+  await p.setUserAgent(DEFAULT_UA);
+  await p.setViewport({ width: 1920, height: 1080 });
+
+  // Apply platform override to match Safari on macOS
+  await p.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, "platform", {
+      get: () => "MacIntel",
+      configurable: true,
+    });
+  });
+
+  await p.evaluateOnNewDocument(() => {
+    if (typeof window.process === "undefined") {
+      window.process = {
+        env: { NODE_ENV: "production" },
+        browser: true,
+        version: "",
+        versions: {},
+      };
+    }
+  });
+
+  // StreamPack: TikTok's own SDK patches `window.fetch` (it needs to, to build the
+  // totalFetchRequests/interceptedFetchRequests counters `_signDirectly` reads from
+  // `window.__cap3` for its own anti-bot signature) — confirmed live: after that
+  // patch, calling `fetch()` against `webcast.tiktok.com/webcast/im/fetch/` resolves
+  // to `undefined` instead of a real Response (`fetchIsNative: false` in the
+  // diagnostic added alongside this fix). `evaluateOnNewDocument` runs before ANY
+  // page script on every navigation (a CDP guarantee), so this always wins the race
+  // and stashes the true native fetch before TikTok's SDK can touch it.
+  await p.evaluateOnNewDocument(() => {
+    window.__streampackNativeFetch = window.fetch.bind(window);
+  });
+
+  // Initialize with local SDK
+  await initWithLocalSdk(p);
 }
 
 /**
@@ -433,7 +455,7 @@ async function dismissTikTokErrorIfPresent(maxAttempts = 2, targetPage = page) {
  * Initialize with TikTok page context and LOCAL SDK
  * Injects local SDK BEFORE page loads using evaluateOnNewDocument
  */
-async function initWithLocalSdk() {
+async function initWithLocalSdk(p = page) {
   if (!localSdkContent) {
     throw new Error(
       "Local SDK not available - ensure webmssdk_5.1.3.js exists in javascript/ folder",
@@ -443,7 +465,7 @@ async function initWithLocalSdk() {
   console.log("[Server] Injecting local SDK before navigation...");
 
   // Inject SDK before any page scripts run
-  await page.evaluateOnNewDocument((sdkCode) => {
+  await p.evaluateOnNewDocument((sdkCode) => {
     try {
       eval(sdkCode);
       console.log("[SDK] Injected via evaluateOnNewDocument");
@@ -454,7 +476,7 @@ async function initWithLocalSdk() {
 
   // Set up request interception to block TikTok's SDK (prevent conflicts)
   console.log("[Server] Setting up request interception...");
-  await page.setRequestInterception(true);
+  await p.setRequestInterception(true);
 
   const requestHandler = async (request) => {
     const url = request.url();
@@ -522,10 +544,10 @@ async function initWithLocalSdk() {
     }
   };
 
-  page.on("request", requestHandler);
+  p.on("request", requestHandler);
 
   console.log("[Server] Navigating to TikTok...");
-  await page.goto("https://www.tiktok.com/@zara", {
+  await p.goto("https://www.tiktok.com/@zara", {
     waitUntil: "domcontentloaded",
     timeout: 60000,
   });
@@ -535,7 +557,7 @@ async function initWithLocalSdk() {
   await new Promise((r) => setTimeout(r, 3000));
 
   // Check SDK status
-  const sdkStatus = await page.evaluate(() => {
+  const sdkStatus = await p.evaluate(() => {
     const hasAcrawler = !!window.byted_acrawler;
     const hasFrontierSign =
       hasAcrawler && typeof window.byted_acrawler.frontierSign === "function";
@@ -553,7 +575,7 @@ async function initWithLocalSdk() {
     // apart "TikTok served a real page but our injection lost a race" from "TikTok (or
     // the proxy) served something else entirely (block page, captcha, error page)".
     try {
-      const pageState = await page.evaluate(() => ({
+      const pageState = await p.evaluate(() => ({
         title: document.title,
         url: location.href,
         bodyPreview: (document.body?.innerText || "").slice(0, 300),
@@ -574,7 +596,7 @@ async function initWithLocalSdk() {
 
   // Warm up the SDK
   console.log("[Server] Warming up SDK...");
-  await page.evaluate(() => window.scrollBy(0, 500));
+  await p.evaluate(() => window.scrollBy(0, 500));
   await new Promise((r) => setTimeout(r, 2000));
 
   // Always reload after the initial load. First load is unreliable — sometimes
@@ -583,7 +605,7 @@ async function initWithLocalSdk() {
   // first pass, after which the page bundle reliably emits signed requests.
   console.log("[Server] Reloading page to stabilize session...");
   try {
-    await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
+    await p.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
   } catch (e) {
     console.log("[Server] Reload warning:", e.message);
   }
@@ -591,10 +613,10 @@ async function initWithLocalSdk() {
 
   // If the second pass still shows the "Something went wrong" interstitial,
   // click its in-page Refresh button to retry once more.
-  await dismissTikTokErrorIfPresent();
+  await dismissTikTokErrorIfPresent(2, p);
 
   // Extract cookies for use in requests
-  cookies = await page.cookies();
+  cookies = await p.cookies();
   console.log(`[Server] Captured ${cookies.length} cookies`);
 }
 
@@ -618,6 +640,7 @@ async function closeBrowser() {
   // browser.close() ya se llevó puesto cualquier BrowserContext de túnel que hubiera —
   // limpiar el mapa para no intentar reusar páginas muertas la próxima vez.
   tunnelContexts.clear();
+  relayPool?.reset();
 
   // Clean up user data directory to prevent disk space accumulation
   try {
@@ -774,6 +797,39 @@ function shouldRefreshSession() {
   return false;
 }
 
+let lastRecycleAt = null;
+let recycling = null;
+
+/**
+ * Proactive refresh WITHOUT closing the browser: a fresh signing page replaces the old
+ * one, so relay pages (and the live rooms they host) keep running. The profile is kept;
+ * the full restart (`closeBrowser`, which wipes it) is left for when no room is live or
+ * the browser itself breaks.
+ */
+async function recycleSigningPage() {
+  if (recycling) return recycling;
+  recycling = (async () => {
+    const old = page;
+    const fresh = await browser.newPage();
+    try {
+      await setupSigningPage(fresh);
+    } catch (e) {
+      fresh.close().catch(() => {});
+      throw e;
+    }
+    page = fresh;
+    signedUrlCache.clear();
+    generationCount = 0;
+    lastInitTime = new Date().toISOString();
+    lastRecycleAt = lastInitTime;
+    old?.close().catch(() => {});
+    console.log(`[Server] Signing page recycled (${relayPool?.activeRooms() ?? 0} live rooms kept)`);
+  })().finally(() => {
+    recycling = null;
+  });
+  return recycling;
+}
+
 /**
  * Check if the page is still valid and ready
  */
@@ -784,7 +840,16 @@ async function ensurePageReady() {
     }
 
     // Check if session should be refreshed to avoid blocks
+    if (recycling) await recycling;
     if (shouldRefreshSession()) {
+      if (relayPool && relayPool.activeRooms() > 0) {
+        try {
+          await recycleSigningPage();
+          return true;
+        } catch (e) {
+          console.log("[Server] Signing page recycle failed, full restart:", e.message);
+        }
+      }
       console.log("[Server] Proactive session refresh...");
       await closeBrowser();
       await initBrowser();
@@ -872,21 +937,25 @@ async function fetchRawBytesThroughPage(signedUrl, targetPage = page) {
  *   vez de romper el pedido — el túnel es la excepción, no lo único que existe.
  */
 async function fetchWebcastRawBytes(targetUrl, userAgent, tunnelId = null) {
+  // With a tunnel, only the SIGNING takes the queue slot; the fetch goes through the
+  // streamer's own page outside it, so a slow connection doesn't hold everyone up.
+  if (tunnelId && TUNNEL_FEATURE_ENABLED) {
+    const signed = await queueSignatureRequest(() => _generateSignedUrlInternal(targetUrl, userAgent, null));
+    try {
+      const tunnelPage = await getOrCreateTunnelPage(tunnelId);
+      return await fetchRawBytesThroughPage(signed.signedUrl, tunnelPage);
+    } catch (e) {
+      console.log(
+        `[tunnel] falló para tunnelId=${tunnelId} (${e.message}) — cayendo al proxy compartido`,
+      );
+      tunnelContexts.delete(tunnelId);
+      return queueSignatureRequest(() => fetchRawBytesThroughPage(signed.signedUrl));
+    }
+  }
+
+  // Without a tunnel: sign + fetch in ONE slot, both on the shared signing page.
   return queueSignatureRequest(async () => {
     const signed = await _generateSignedUrlInternal(targetUrl, userAgent, null);
-
-    if (tunnelId && TUNNEL_FEATURE_ENABLED) {
-      try {
-        const tunnelPage = await getOrCreateTunnelPage(tunnelId);
-        return await fetchRawBytesThroughPage(signed.signedUrl, tunnelPage);
-      } catch (e) {
-        console.log(
-          `[tunnel] falló para tunnelId=${tunnelId} (${e.message}) — cayendo al proxy compartido`,
-        );
-        tunnelContexts.delete(tunnelId);
-      }
-    }
-
     return fetchRawBytesThroughPage(signed.signedUrl);
   });
 }
@@ -1251,10 +1320,19 @@ const tryHandleWebcastRoute = createWebcastRoutes({
 
 // Proxies the real TikTok live-push WebSocket through this same browser session — see
 // routes/ws-proxy.mjs for why a plain Node `ws` connection to TikTok gets soft-rejected.
-const wsProxy = createWsProxyRoutes({
+let wsProxy;
+const relayPool = RELAY_POOL_ENABLED
+  ? createRelayPool({
+      getBrowser: () => browser,
+      installBridge: (p) => wsProxy.installBridge(p),
+      userAgent: DEFAULT_UA,
+    })
+  : null;
+wsProxy = createWsProxyRoutes({
   initBrowser,
   ensurePageReady,
   getPage: () => page,
+  relayPool,
 });
 
 /**
@@ -1263,12 +1341,9 @@ const wsProxy = createWsProxyRoutes({
 async function handleRequest(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
+  // No CORS headers: only the gateway calls this server, from the internal network.
   if (req.method === "OPTIONS") {
-    res.writeHead(200);
+    res.writeHead(204);
     res.end();
     return;
   }
@@ -1302,6 +1377,10 @@ async function handleRequest(req, res) {
           maxSessionAgeMinutes: MAX_SESSION_AGE_MS / 60000,
           queueLength: requestQueue.length,
           isProcessing: isProcessingQueue,
+          lastRecycleAt,
+          relayPoolEnabled: RELAY_POOL_ENABLED,
+          ...(relayPool ? relayPool.stats() : {}),
+          tunnelContexts: tunnelContexts.size,
           localSdkAvailable: !!localSdkContent,
           proxyEnabled: PROXY_ENABLED,
           userAgent: currentUserAgent,
@@ -1450,6 +1529,12 @@ async function handleRequest(req, res) {
 
     // Restart browser
     if (url.pathname === "/restart") {
+      // Drops every live room: only with the internal secret, and never by GET.
+      if (!SIGNER_INTERNAL_SECRET || req.method !== "POST" || !safeEqual(req.headers["x-signer-secret"], SIGNER_INTERNAL_SECRET)) {
+        res.writeHead(403);
+        res.end(JSON.stringify({ error: "forbidden" }));
+        return;
+      }
       console.log("[Server] Restarting browser...");
       await closeBrowser();
       await initBrowser();
@@ -1466,6 +1551,14 @@ async function handleRequest(req, res) {
     res.writeHead(500);
     res.end(JSON.stringify({ status: "error", message: e.message }));
   }
+}
+
+/** Constant-time comparison for the internal secret. */
+function safeEqual(given, expected) {
+  if (typeof given !== "string") return false;
+  const a = crypto.createHash("sha256").update(given).digest();
+  const b = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
 }
 
 // Create server
@@ -1490,7 +1583,7 @@ server.listen(PORT, () => {
     `  POST /fetch     - Fetch through browser (fallback, 100% reliable)`,
   );
   console.log(`  GET  /health    - Health check`);
-  console.log(`  GET  /restart   - Restart browser session`);
+  console.log(`  POST /restart   - Restart browser session (x-signer-secret)`);
   console.log(`  WS   /webcast/ws-proxy?target=... - proxies a WS through the browser`);
 
   // Initialize browser on startup

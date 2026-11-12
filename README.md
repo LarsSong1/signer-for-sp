@@ -149,13 +149,24 @@ curl http://localhost:8080/health
 }
 ```
 
-### GET /restart
+### POST /restart
 
-Restart the browser session (useful if signatures stop working).
+Restart the browser session (useful if signatures stop working). It drops every live
+room, so it needs the `x-signer-secret` header (`SIGNER_INTERNAL_SECRET`); without that
+variable the route is disabled.
 
 ```bash
-curl http://localhost:8080/restart
+curl -X POST -H "x-signer-secret: $SIGNER_INTERNAL_SECRET" http://localhost:8080/restart
 ```
+
+### Relay pages and session refresh
+
+Live-room WebSockets (`/webcast/ws-proxy`) run in separate **relay pages**
+(`RELAY_ROOMS_PER_PAGE` rooms each, default 40), not in the signing page. The proactive
+refresh (`MAX_SESSION_AGE_MS` / `MAX_GENERATIONS_BEFORE_REFRESH`) then only replaces the
+signing page while rooms are live, instead of closing the whole browser. `RELAY_POOL=0`
+restores the old behaviour. `/health` reports `relayPages`, `relayRooms`,
+`roomsPerRelay` and `lastRecycleAt`.
 
 ## Usage Examples
 
@@ -611,7 +622,7 @@ async function fetchWithRetry(url, maxRetries = 3) {
 curl http://localhost:8080/health
 
 # Restart browser if issues occur
-curl http://localhost:8080/restart
+curl -X POST -H "x-signer-secret: $SIGNER_INTERNAL_SECRET" http://localhost:8080/restart
 ```
 
 ## Troubleshooting
@@ -634,7 +645,7 @@ This error occurs when the browser fingerprint params in your URL don't match th
 1. **Restart the browser session:**
 
    ```bash
-   curl http://localhost:8080/restart
+   curl -X POST -H "x-signer-secret: $SIGNER_INTERNAL_SECRET" http://localhost:8080/restart
    ```
 
 2. **Use the /fetch endpoint:** If external requests with signed URLs fail, use `/fetch` which makes requests through the browser.

@@ -37,7 +37,12 @@ import { randomUUID } from "crypto";
 
 const OPEN_TIMEOUT_MS = 15000;
 
-export function createWsProxyRoutes({ getPage, initBrowser, ensurePageReady }) {
+/**
+ * `relayPool` (optional, see relay-pool.mjs): when given, each room's socket lives in a
+ * relay page instead of the signing page, so recycling the signing session no longer
+ * drops live rooms. Without it, the old behaviour (everything in the signing page).
+ */
+export function createWsProxyRoutes({ getPage, initBrowser, ensurePageReady, relayPool = null }) {
   const wss = new WebSocketServer({ noServer: true });
   /** id -> the local (gateway-facing) WebSocket for that in-page connection. */
   const localSockets = new Map();
@@ -68,6 +73,7 @@ export function createWsProxyRoutes({ getPage, initBrowser, ensurePageReady }) {
     }
     if (type === "close" || type === "error") {
       localSockets.delete(id);
+      relayPool?.release(id);
       try {
         local.close(type === "error" ? 1011 : 1000, type);
       } catch {}
@@ -162,6 +168,18 @@ export function createWsProxyRoutes({ getPage, initBrowser, ensurePageReady }) {
     }
 
     const id = randomUUID();
+    let hostPage;
+    try {
+      hostPage = relayPool ? await relayPool.acquire(id) : getPage();
+    } catch (e) {
+      console.log(`[relay] could not get a relay page: ${e.message}`);
+      socket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    /** The page that hosts this room (a relay or, without the pool, the signing page). */
+    const pageOf = () => (relayPool ? relayPool.pageFor(id) : getPage());
+    const releaseRoom = () => relayPool?.release(id);
 
     // Open the REAL TikTok socket and wait for it to actually finish connecting BEFORE
     // completing the gateway-facing upgrade — see the module header comment for why.
@@ -176,7 +194,7 @@ export function createWsProxyRoutes({ getPage, initBrowser, ensurePageReady }) {
       }
     }, OPEN_TIMEOUT_MS);
 
-    getPage()
+    hostPage
       .evaluate((wsId, wsUrl) => window.__spWsOpen(wsId, wsUrl), id, target)
       .catch((e) => {
         const pending = pendingOpens.get(id);
@@ -192,11 +210,12 @@ export function createWsProxyRoutes({ getPage, initBrowser, ensurePageReady }) {
       clearTimeout(timeout);
       socket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
       socket.destroy();
-      getPage()
+      hostPage
         .evaluate((wsId) => {
           if (window.__spWsClose) window.__spWsClose(wsId);
         }, id)
         .catch(() => {});
+      releaseRoom();
       return;
     }
     clearTimeout(timeout);
@@ -206,7 +225,9 @@ export function createWsProxyRoutes({ getPage, initBrowser, ensurePageReady }) {
 
       local.on("message", (data) => {
         const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-        getPage()
+        const p = pageOf();
+        if (!p) return;
+        p
           .evaluate((wsId, b64) => {
             if (window.__spWsSend) window.__spWsSend(wsId, b64);
           }, id, buf.toString("base64"))
@@ -215,7 +236,10 @@ export function createWsProxyRoutes({ getPage, initBrowser, ensurePageReady }) {
 
       local.on("close", () => {
         localSockets.delete(id);
-        getPage()
+        const p = pageOf();
+        releaseRoom();
+        if (!p) return;
+        p
           .evaluate((wsId) => {
             if (window.__spWsClose) window.__spWsClose(wsId);
           }, id)
